@@ -37,6 +37,17 @@ Lokal API veya mock backend ile calistirmak icin:
 ./scripts/flutter.sh run --dart-define=MOCK_BACKEND=true
 ```
 
+Mobil uygulama sesli soru ve sesli cevap icin ucretli bir bulut servisine dogrudan baglanmaz:
+
+- `speech_to_text`: Cihazdaki Android/iOS konusma tanima kabiliyetini kullanir.
+- `flutter_tts`: Cihazdaki Android/iOS text-to-speech motorunu kullanir.
+
+Ses akisi:
+
+```text
+Mikrofon -> konusma metne cevrilir -> /assistant/ask -> cevap ekrana yazilir -> cevap sesli okunur
+```
+
 Telefon ayni yerel agdan bu bilgisayardaki API'ye baglanacaksa bilgisayarin IP adresini kullanin:
 
 ```bash

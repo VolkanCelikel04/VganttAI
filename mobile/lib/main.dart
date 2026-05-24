@@ -1,4 +1,7 @@
 import 'package:flutter/material.dart';
+import 'package:flutter_tts/flutter_tts.dart';
+import 'package:speech_to_text/speech_recognition_result.dart';
+import 'package:speech_to_text/speech_to_text.dart' as stt;
 
 import 'core/api_client.dart';
 
@@ -219,8 +222,10 @@ class AssistantScreen extends StatefulWidget {
 
 class _AssistantScreenState extends State<AssistantScreen> {
   final _questionController = TextEditingController(
-    text: 'Son 10 faturayi getir',
+    text: 'Bugun acilan satis siparisleri ne kadar?',
   );
+  final _speechToText = stt.SpeechToText();
+  final _flutterTts = FlutterTts();
   final List<_ChatMessage> _messages = const [
     _ChatMessage(
       role: _MessageRole.assistant,
@@ -230,11 +235,140 @@ class _AssistantScreenState extends State<AssistantScreen> {
   ].toList();
   AssistantAnswer? _latestAnswer;
   var _isLoading = false;
+  var _speechReady = false;
+  var _isListening = false;
+  var _isSpeaking = false;
+  String? _voiceStatus;
+
+  @override
+  void initState() {
+    super.initState();
+    _configureSpeech();
+    _configureTts();
+  }
 
   @override
   void dispose() {
+    _speechToText.cancel();
+    _flutterTts.stop();
     _questionController.dispose();
     super.dispose();
+  }
+
+  Future<void> _configureSpeech() async {
+    final ready = await _speechToText.initialize(
+      onStatus: (status) {
+        if (!mounted) {
+          return;
+        }
+
+        setState(() {
+          _isListening = status == 'listening';
+          if (status == 'done' || status == 'notListening') {
+            _voiceStatus = null;
+          }
+        });
+      },
+      onError: (error) {
+        if (!mounted) {
+          return;
+        }
+
+        setState(() {
+          _isListening = false;
+          _voiceStatus = error.errorMsg;
+        });
+      },
+    );
+
+    if (!mounted) {
+      return;
+    }
+
+    setState(() {
+      _speechReady = ready;
+      _voiceStatus = ready ? null : 'Ses tanima kullanilamiyor';
+    });
+  }
+
+  Future<void> _configureTts() async {
+    await _flutterTts.setLanguage('tr-TR');
+    await _flutterTts.setSpeechRate(0.48);
+    await _flutterTts.setPitch(1);
+    await _flutterTts.setVolume(1);
+    await _flutterTts.awaitSpeakCompletion(false);
+    _flutterTts.setStartHandler(() {
+      if (mounted) {
+        setState(() => _isSpeaking = true);
+      }
+    });
+    _flutterTts.setCompletionHandler(() {
+      if (mounted) {
+        setState(() => _isSpeaking = false);
+      }
+    });
+    _flutterTts.setCancelHandler(() {
+      if (mounted) {
+        setState(() => _isSpeaking = false);
+      }
+    });
+    _flutterTts.setErrorHandler((_) {
+      if (mounted) {
+        setState(() => _isSpeaking = false);
+      }
+    });
+  }
+
+  Future<void> _toggleListening() async {
+    if (_isLoading) {
+      return;
+    }
+
+    await _flutterTts.stop();
+
+    if (!_speechReady) {
+      await _configureSpeech();
+      if (!_speechReady) {
+        return;
+      }
+    }
+
+    if (_speechToText.isListening) {
+      await _speechToText.stop();
+      return;
+    }
+
+    setState(() {
+      _voiceStatus = 'Dinleniyor';
+    });
+
+    await _speechToText.listen(
+      onResult: _onSpeechResult,
+      listenOptions: stt.SpeechListenOptions(
+        localeId: 'tr_TR',
+        listenMode: stt.ListenMode.dictation,
+        pauseFor: const Duration(seconds: 2),
+        listenFor: const Duration(seconds: 20),
+      ),
+    );
+  }
+
+  void _onSpeechResult(SpeechRecognitionResult result) {
+    final words = result.recognizedWords.trim();
+    if (words.isEmpty) {
+      return;
+    }
+
+    setState(() {
+      _questionController.text = words;
+      _questionController.selection = TextSelection.collapsed(
+        offset: _questionController.text.length,
+      );
+    });
+
+    if (result.finalResult) {
+      _ask();
+    }
   }
 
   Future<void> _ask() async {
@@ -247,6 +381,7 @@ class _AssistantScreenState extends State<AssistantScreen> {
       _messages.add(_ChatMessage(role: _MessageRole.user, text: question));
       _isLoading = true;
       _latestAnswer = null;
+      _voiceStatus = null;
       _questionController.clear();
     });
 
@@ -262,6 +397,7 @@ class _AssistantScreenState extends State<AssistantScreen> {
           _ChatMessage(role: _MessageRole.assistant, text: answer.summary),
         );
       });
+      await _speakAnswer(answer);
     } catch (error) {
       setState(() {
         _messages.add(
@@ -275,6 +411,40 @@ class _AssistantScreenState extends State<AssistantScreen> {
         });
       }
     }
+  }
+
+  Future<void> _speakAnswer(AssistantAnswer answer) async {
+    final spokenAnswer = _buildSpokenAnswer(answer);
+    if (spokenAnswer.isEmpty) {
+      return;
+    }
+
+    await _flutterTts.stop();
+    await _flutterTts.speak(spokenAnswer);
+  }
+
+  String _buildSpokenAnswer(AssistantAnswer answer) {
+    if (answer.rows.isEmpty) {
+      return answer.summary;
+    }
+
+    final rowCountText = '${answer.rows.length} satir sonuc geldi.';
+    final firstRow = answer.rows.first;
+    final details = <String>[];
+
+    for (var index = 0; index < answer.columns.length; index += 1) {
+      if (index >= firstRow.length) {
+        break;
+      }
+
+      details.add('${answer.columns[index]}: ${firstRow[index]}');
+    }
+
+    if (details.isEmpty) {
+      return '${answer.summary} $rowCountText';
+    }
+
+    return '${answer.summary} $rowCountText Ilk sonuc: ${details.join(', ')}.';
   }
 
   @override
@@ -312,29 +482,61 @@ class _AssistantScreenState extends State<AssistantScreen> {
             if (_latestAnswer != null) _ResultPreview(answer: _latestAnswer!),
             Padding(
               padding: const EdgeInsets.fromLTRB(16, 10, 16, 16),
-              child: Row(
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                crossAxisAlignment: CrossAxisAlignment.stretch,
                 children: [
-                  Expanded(
-                    child: TextField(
-                      controller: _questionController,
-                      minLines: 1,
-                      maxLines: 4,
-                      decoration: const InputDecoration(
-                        hintText: 'Orn: Bu ay en cok satis yapilan 5 urun',
+                  if (_voiceStatus != null) ...[
+                    Text(
+                      _voiceStatus!,
+                      style: Theme.of(context).textTheme.bodySmall?.copyWith(
+                        color: Theme.of(context).colorScheme.primary,
                       ),
-                      onSubmitted: (_) => _ask(),
                     ),
-                  ),
-                  const SizedBox(width: 10),
-                  IconButton.filled(
-                    tooltip: 'Sor',
-                    onPressed: _isLoading ? null : _ask,
-                    icon: _isLoading
-                        ? const SizedBox.square(
-                            dimension: 18,
-                            child: CircularProgressIndicator(strokeWidth: 2),
-                          )
-                        : const Icon(Icons.send),
+                    const SizedBox(height: 8),
+                  ],
+                  Row(
+                    children: [
+                      Expanded(
+                        child: TextField(
+                          controller: _questionController,
+                          minLines: 1,
+                          maxLines: 4,
+                          decoration: const InputDecoration(
+                            hintText:
+                                'Orn: Bugun acilan satis siparisleri ne kadar?',
+                          ),
+                          onSubmitted: (_) => _ask(),
+                        ),
+                      ),
+                      const SizedBox(width: 8),
+                      IconButton.filledTonal(
+                        tooltip: _isListening ? 'Dinlemeyi durdur' : 'Konus',
+                        onPressed: _isLoading ? null : _toggleListening,
+                        icon: Icon(_isListening ? Icons.mic : Icons.mic_none),
+                      ),
+                      const SizedBox(width: 8),
+                      IconButton.filled(
+                        tooltip: 'Sor',
+                        onPressed: _isLoading ? null : _ask,
+                        icon: _isLoading
+                            ? const SizedBox.square(
+                                dimension: 18,
+                                child: CircularProgressIndicator(
+                                  strokeWidth: 2,
+                                ),
+                              )
+                            : const Icon(Icons.send),
+                      ),
+                      if (_isSpeaking) ...[
+                        const SizedBox(width: 8),
+                        IconButton.outlined(
+                          tooltip: 'Sesi durdur',
+                          onPressed: _flutterTts.stop,
+                          icon: const Icon(Icons.volume_off_outlined),
+                        ),
+                      ],
+                    ],
                   ),
                 ],
               ),
