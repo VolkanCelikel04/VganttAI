@@ -1,0 +1,15 @@
+.config/
+.dart-tool/
+.dartServer/
+.flutter
+.pub-cache/
+Library/
+tools/
+
+.DS_Store
+.env
+api/.env
+api/env.local
+api/bin/
+api/obj/
+publish/

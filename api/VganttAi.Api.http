@@ -1,0 +1,6 @@
+@VganttAi.Api_HostAddress = http://127.0.0.1:5055
+
+GET {{VganttAi.Api_HostAddress}}/health
+Accept: application/json
+
+###

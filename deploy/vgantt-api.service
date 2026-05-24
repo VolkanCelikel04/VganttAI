@@ -1,0 +1,18 @@
+[Unit]
+Description=Vgantt API
+After=network.target
+
+[Service]
+WorkingDirectory=/var/www/vgantt-api
+ExecStart=/var/www/vgantt-api/VganttAi.Api
+EnvironmentFile=/var/www/vgantt-api/env.local
+Restart=always
+RestartSec=5
+KillSignal=SIGINT
+SyslogIdentifier=vgantt-api
+User=www-data
+Group=www-data
+Environment=ASPNETCORE_ENVIRONMENT=Production
+
+[Install]
+WantedBy=multi-user.target
