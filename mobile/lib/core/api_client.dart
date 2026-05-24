@@ -81,7 +81,17 @@ limit 10''',
     );
 
     if (response.statusCode < 200 || response.statusCode >= 300) {
-      throw ApiException('API hata verdi: ${response.statusCode}');
+      var message = 'API hata verdi: ${response.statusCode}';
+      try {
+        final errorJson = jsonDecode(response.body) as Map<String, dynamic>;
+        if (errorJson['message'] != null) {
+          message = '$message - ${errorJson['message']}';
+        }
+      } catch (_) {
+        // Keep the status-only message if the response is not JSON.
+      }
+
+      throw ApiException(message);
     }
 
     return jsonDecode(response.body) as Map<String, dynamic>;

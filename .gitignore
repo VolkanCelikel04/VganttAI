@@ -10,6 +10,7 @@ tools/
 .env
 api/.env
 api/env.local
+api/.vs/
 api/bin/
 api/obj/
 publish/

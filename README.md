@@ -37,14 +37,22 @@ Lokal API veya mock backend ile calistirmak icin:
 ./scripts/flutter.sh run --dart-define=MOCK_BACKEND=true
 ```
 
+Telefon ayni yerel agdan bu bilgisayardaki API'ye baglanacaksa bilgisayarin IP adresini kullanin:
+
+```bash
+./scripts/flutter.sh run --dart-define=API_BASE_URL=http://192.168.1.180:5055
+```
+
 ## API
 
-Backend PostgreSQL baglantisini ortam degiskeninden okur. Production'da API ve PostgreSQL ayni Hetzner sunucusunda konumlanir; PostgreSQL disariya acilmaz, API `localhost:5432` uzerinden baglanir.
+Backend PostgreSQL baglantisini ortam degiskeninden okur. Yerel server kurulumunda API ve PostgreSQL bu bilgisayarda calisir; ERP baglantisi bilgisayarin VPN erisimi uzerinden yapilir.
 
-Sunucuda `api/.env` icin beklenen ana deger:
+`api/env.local` icin beklenen ana degerler:
 
 ```bash
 VGANTT_REGISTRY_CONNECTION="Host=localhost;Port=5432;Database=vgantt_db;Username=vganttuser;Password=DB_PASSWORD;SSL Mode=Disable"
+VGANTT_API_BIND_HOST=0.0.0.0
+VGANTT_API_PORT=5055
 ```
 
 Migration ve ilk admin kullanicisi:
