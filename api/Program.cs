@@ -689,15 +689,18 @@ static string BuildAdminAppPage(AuthenticatedUser session, string activePage)
     var viewsActive = activePage == "views" ? "active" : "";
     var columnsActive = activePage == "columns" ? "active" : "";
     var relationsActive = activePage == "relations" ? "active" : "";
-    var pageTitle = activePage == "columns" ? "View Columns" : "Views";
-    var pageSubtitle = activePage == "columns"
-        ? "Excel veya metin yapistirarak kolonlari hizli yonetin."
-        : "View ekleme, display name guncelleme ve aktif/pasif yonetimi.";
-    if (activePage == "relations")
+    var pageTitle = activePage switch
     {
-        pageTitle = "View Relations";
-        pageSubtitle = "Relation sec, duzenle ve kaydet.";
-    }
+        "columns" => "Kolonlar",
+        "relations" => "Iliskiler",
+        _ => "Viewler"
+    };
+    var pageSubtitle = activePage switch
+    {
+        "columns" => "Secili view icin kolon sozlugunu yonetin.",
+        "relations" => "Viewler arasindaki iliskileri yonetin.",
+        _ => "ERP view tanimlarini yonetin."
+    };
 
     return $$"""
 <!doctype html>
@@ -710,28 +713,31 @@ static string BuildAdminAppPage(AuthenticatedUser session, string activePage)
     :root {
       color-scheme: light;
       font-family: Segoe UI, Arial, sans-serif;
-      background: #f6f7f9;
-      color: #1f2933;
-      --line: #d9e0e7;
-      --muted: #65707c;
-      --primary: #16697a;
-      --primary-dark: #0f5361;
+      background: #f4f6f8;
+      color: #18232f;
+      --line: #d7dee7;
+      --muted: #667085;
+      --primary: #146c5f;
+      --primary-dark: #0f554b;
       --surface: #ffffff;
       --danger: #b42318;
       --success: #16794c;
+      --warning: #8a5a00;
+      --soft: #f8fafc;
     }
 
     * { box-sizing: border-box; }
-    body { margin: 0; background: #f6f7f9; }
+    body { margin: 0; background: #f4f6f8; }
     .app-shell { min-height: 100vh; display: grid; grid-template-columns: 240px minmax(0, 1fr); }
-    .sidebar { background: #17242b; color: #f9fafb; padding: 18px 14px; }
+    .sidebar { background: #18232f; color: #f9fafb; padding: 18px 14px; }
     .brand { display: grid; gap: 2px; padding: 8px 8px 18px; border-bottom: 1px solid rgba(255,255,255,.14); }
     .brand strong { font-size: 18px; }
     .brand span { color: #b8c4cc; font-size: 12px; }
     .nav-section { margin-top: 18px; }
     .nav-title { color: #b8c4cc; font-size: 12px; font-weight: 700; margin: 0 8px 8px; text-transform: uppercase; }
-    .nav-item { display: flex; align-items: center; color: #fff; border-radius: 6px; padding: 10px 12px; font-weight: 700; text-decoration: none; margin-bottom: 6px; }
-    .nav-item.active { background: rgba(255,255,255,.12); }
+    .nav-item { display: flex; align-items: center; color: #fff; border-radius: 8px; padding: 10px 12px; font-weight: 700; text-decoration: none; margin-bottom: 6px; }
+    .nav-item.active { background: rgba(255,255,255,.14); }
+    .nav-item:hover { background: rgba(255,255,255,.09); }
     .content { min-width: 0; }
     .topbar { min-height: 65px; background: var(--surface); border-bottom: 1px solid var(--line); display: flex; align-items: center; justify-content: space-between; gap: 16px; padding: 14px 24px; }
     h1 { font-size: 24px; margin: 0 0 4px; }
@@ -742,37 +748,50 @@ static string BuildAdminAppPage(AuthenticatedUser session, string activePage)
     .logout { color: var(--primary); font-weight: 700; text-decoration: none; border: 0; background: transparent; cursor: pointer; padding: 0; }
     .section { background: var(--surface); border: 1px solid var(--line); border-radius: 8px; padding: 20px; }
     .hidden { display: none; }
-    .grid-2 { display: grid; grid-template-columns: 360px minmax(0, 1fr); gap: 16px; align-items: start; }
+    .grid-2 { display: grid; grid-template-columns: minmax(330px, 420px) minmax(0, 1fr); gap: 16px; align-items: start; }
+    .form-section { position: sticky; top: 16px; }
     .stats { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px; }
     .stat { border: 1px solid var(--line); border-radius: 8px; padding: 16px; background: #fff; }
     .stat strong { display: block; font-size: 28px; margin-bottom: 4px; }
     form { display: grid; gap: 12px; }
-    label { display: grid; gap: 6px; font-size: 13px; font-weight: 600; color: #344054; }
-    input, textarea, select { border: 1px solid #c8d0d9; border-radius: 6px; font: inherit; padding: 9px 10px; min-width: 0; }
-    textarea { min-height: 84px; resize: vertical; }
+    label { display: grid; gap: 6px; font-size: 13px; font-weight: 700; color: #344054; }
+    input, textarea, select { border: 1px solid #c8d0d9; border-radius: 8px; font: inherit; padding: 10px 11px; min-width: 0; background: #fff; }
+    input:focus, textarea:focus, select:focus { border-color: var(--primary); box-shadow: 0 0 0 3px rgba(20,108,95,.14); outline: none; }
+    textarea { min-height: 92px; resize: vertical; }
     .check-row { display: flex; gap: 16px; flex-wrap: wrap; }
-    .check-row label { display: flex; align-items: center; gap: 6px; }
+    .check-row label { display: flex; align-items: center; gap: 6px; border: 1px solid var(--line); border-radius: 8px; padding: 8px 10px; background: var(--soft); }
+    details.advanced { border: 1px solid var(--line); border-radius: 8px; background: var(--soft); padding: 10px 12px; }
+    details.advanced summary { cursor: pointer; font-weight: 800; color: #344054; }
+    details.advanced .advanced-body { display: grid; gap: 12px; padding-top: 12px; }
     table { width: 100%; border-collapse: collapse; }
-    th, td { border-bottom: 1px solid var(--line); padding: 8px; text-align: left; vertical-align: top; }
+    th, td { border-bottom: 1px solid var(--line); padding: 10px; text-align: left; vertical-align: middle; }
     th { color: #344054; font-size: 13px; background: #f8fafc; }
     td.mono { font-family: Consolas, monospace; font-size: 13px; }
     .table-wrap { overflow: auto; border: 1px solid var(--line); border-radius: 8px; }
+    tbody tr { cursor: pointer; }
+    tbody tr:hover { background: #f8fafc; }
+    tbody tr.is-selected { background: #eef8f5; }
     .toolbar { display: flex; align-items: end; justify-content: space-between; gap: 12px; margin-bottom: 12px; }
     .button-row { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
-    button.primary, button.secondary, button.icon { border-radius: 6px; font: inherit; font-weight: 700; padding: 9px 12px; cursor: pointer; }
+    button.primary, button.secondary, button.icon { border-radius: 8px; font: inherit; font-weight: 700; padding: 10px 13px; cursor: pointer; }
     button.primary { border: 0; background: var(--primary); color: #fff; }
     button.primary:hover { background: var(--primary-dark); }
     button.secondary, button.icon { border: 1px solid var(--line); background: #fff; color: #1f2933; }
+    button.secondary:hover, button.icon:hover { border-color: #aab5c2; background: #f8fafc; }
     button:disabled { opacity: .65; cursor: wait; }
     .message { min-height: 22px; font-size: 14px; font-weight: 600; }
     .message.ok { color: var(--success); }
     .message.error { color: var(--danger); }
+    .status { display: inline-flex; align-items: center; justify-content: center; min-width: 58px; border-radius: 999px; padding: 4px 9px; font-size: 12px; font-weight: 800; }
+    .status.active { background: #e7f6ee; color: var(--success); }
+    .status.passive { background: #fff3cd; color: var(--warning); }
     .relation-columns { display: grid; gap: 8px; }
-    .relation-column-row { display: grid; grid-template-columns: 70px minmax(0, 1fr) 28px minmax(0, 1fr) 40px; gap: 8px; align-items: end; }
+    .relation-column-row { display: grid; grid-template-columns: 64px minmax(0, 1fr) 28px minmax(0, 1fr) 56px; gap: 8px; align-items: end; }
     .equals { align-self: center; text-align: center; color: var(--muted); font-weight: 700; }
 
     @media (max-width: 900px) {
       .app-shell, .grid-2, .stats, .relation-column-row { grid-template-columns: 1fr; }
+      .form-section { position: static; }
       .sidebar { padding: 12px; }
       .topbar, .toolbar { display: grid; }
       .user-meta { text-align: left; }
@@ -788,9 +807,9 @@ static string BuildAdminAppPage(AuthenticatedUser session, string activePage)
       </div>
       <nav class="nav-section">
         <p class="nav-title">Admin</p>
-        <a class="nav-item {{viewsActive}}" href="/admin/settings/views">Views</a>
-        <a class="nav-item {{columnsActive}}" href="/admin/settings/columns">View Columns</a>
-        <a class="nav-item {{relationsActive}}" href="/admin/settings/relations">View Relations</a>
+        <a class="nav-item {{viewsActive}}" href="/admin/settings/views">Viewler</a>
+        <a class="nav-item {{columnsActive}}" href="/admin/settings/columns">Kolonlar</a>
+        <a class="nav-item {{relationsActive}}" href="/admin/settings/relations">Iliskiler</a>
       </nav>
     </aside>
     <div class="content">
@@ -806,14 +825,14 @@ static string BuildAdminAppPage(AuthenticatedUser session, string activePage)
       </header>
       <main>
         <section id="viewsPage" class="grid-2 hidden">
-          <div class="section">
-            <h2>View Tanimi</h2>
+          <div class="section form-section">
+            <h2>View Bilgisi</h2>
             <form id="viewForm">
               <input id="viewId" type="hidden">
-              <label>view_name<input id="viewName" placeholder="vgantt_ai_customer_order" required></label>
-              <label>display_name_tr<input id="viewDisplayNameTr" placeholder="Musteri Siparisleri"></label>
-              <label>description_tr<textarea id="viewDescriptionTr" placeholder="Satis siparis baslik bilgileri"></textarea></label>
-              <div class="check-row"><label><input id="viewIsActive" type="checkbox" checked> is_active</label></div>
+              <label>Veritabanindaki View Adi<input id="viewName" placeholder="vgantt_ai_customer_order" required></label>
+              <label>Ekran Adi<input id="viewDisplayNameTr" placeholder="Musteri Siparisleri"></label>
+              <label>Aciklama<textarea id="viewDescriptionTr" placeholder="Satis siparis baslik bilgileri"></textarea></label>
+              <div class="check-row"><label><input id="viewIsActive" type="checkbox" checked> Aktif</label></div>
               <div class="button-row">
                 <button class="primary" type="submit">Kaydet</button>
                 <button id="newViewButton" class="secondary" type="button">Yeni</button>
@@ -823,32 +842,37 @@ static string BuildAdminAppPage(AuthenticatedUser session, string activePage)
           </div>
           <div class="section">
             <div class="toolbar">
-              <h2>Views</h2>
+              <h2>View Listesi</h2>
               <button id="refreshViewsButton" class="secondary" type="button">Yenile</button>
             </div>
             <div class="table-wrap">
               <table>
-                <thead><tr><th>view_id</th><th>view_name</th><th>display_name_tr</th><th>is_active</th><th>islem</th></tr></thead>
+                <thead><tr><th>ID</th><th>Teknik Ad</th><th>Ekran Adi</th><th>Durum</th><th>Islem</th></tr></thead>
                 <tbody id="viewsBody"></tbody>
               </table>
             </div>
           </div>
         </section>
         <section id="columnsPage" class="grid-2 hidden">
-          <div class="section">
-            <h2>Kolon Tanimi</h2>
+          <div class="section form-section">
+            <h2>Kolon Bilgisi</h2>
             <form id="columnForm">
               <label>View<select id="columnsViewSelect"></select></label>
-              <label>column_name<input id="columnNameInput" placeholder="order_no" required></label>
-              <label>display_name_tr<input id="columnDisplayNameInput" placeholder="Siparis No"></label>
-              <label>data_type<input id="columnDataTypeInput" placeholder="text"></label>
-              <label>semantic_meaning_tr<textarea id="columnSemanticInput" placeholder="Kolon anlami"></textarea></label>
-              <div class="check-row">
-                <label><input id="columnFilterableInput" type="checkbox" checked> is_filterable</label>
-                <label><input id="columnGroupableInput" type="checkbox" checked> is_groupable</label>
-                <label><input id="columnSummableInput" type="checkbox"> is_summable</label>
-                <label><input id="columnActiveInput" type="checkbox" checked> is_active</label>
-              </div>
+              <label>Veritabanindaki Kolon Adi<input id="columnNameInput" placeholder="order_no" required></label>
+              <label>Ekran Adi<input id="columnDisplayNameInput" placeholder="Siparis No"></label>
+              <label>AI Anlami<textarea id="columnSemanticInput" placeholder="Kolon anlami"></textarea></label>
+              <details class="advanced">
+                <summary>Gelismis ayarlar</summary>
+                <div class="advanced-body">
+                  <label>Veri Tipi<input id="columnDataTypeInput" placeholder="text"></label>
+                  <div class="check-row">
+                    <label><input id="columnFilterableInput" type="checkbox" checked> Filtre</label>
+                    <label><input id="columnGroupableInput" type="checkbox" checked> Gruplama</label>
+                    <label><input id="columnSummableInput" type="checkbox"> Toplam</label>
+                    <label><input id="columnActiveInput" type="checkbox" checked> Aktif</label>
+                  </div>
+                </div>
+              </details>
               <div class="button-row">
                 <button class="primary" type="submit">Kaydet</button>
                 <button id="newColumnButton" class="secondary" type="button">Yeni</button>
@@ -858,14 +882,14 @@ static string BuildAdminAppPage(AuthenticatedUser session, string activePage)
           </div>
           <div class="section">
             <div class="toolbar">
-              <h2>Columns</h2>
+              <h2>Kolon Listesi</h2>
               <button id="refreshColumnsButton" class="secondary" type="button">Yenile</button>
             </div>
             <div class="table-wrap">
               <table>
                 <thead>
                   <tr>
-                    <th>column_name</th><th>display_name_tr</th><th>data_type</th><th>active</th><th>islem</th>
+                    <th>Teknik Ad</th><th>Ekran Adi</th><th>Veri Tipi</th><th>Durum</th><th>Islem</th>
                   </tr>
                 </thead>
                 <tbody id="columnsBody"></tbody>
@@ -874,25 +898,30 @@ static string BuildAdminAppPage(AuthenticatedUser session, string activePage)
           </div>
         </section>
         <section id="relationsPage" class="grid-2 hidden">
-          <div class="section">
-            <h2>Relation Tanimi</h2>
+          <div class="section form-section">
+            <h2>Iliski Bilgisi</h2>
             <form id="relationForm">
               <input id="relationId" type="hidden">
-              <label>relation_name<input id="relationName" placeholder="customer_order_to_lines" required></label>
-              <label>source_view_id<select id="sourceViewSelect"></select></label>
-              <label>target_view_id<select id="targetViewSelect"></select></label>
-              <label>join_type
-                <select id="joinType">
-                  <option>INNER JOIN</option>
-                  <option>LEFT JOIN</option>
-                  <option>RIGHT JOIN</option>
-                  <option>FULL JOIN</option>
-                </select>
-              </label>
-              <label>description_tr<textarea id="relationDescriptionTr" placeholder="Relation aciklamasi"></textarea></label>
-              <div class="check-row"><label><input id="relationIsActive" type="checkbox" checked> is_active</label></div>
-              <h2>Relation Columns</h2>
+              <label>Kaynak View<select id="sourceViewSelect"></select></label>
+              <label>Hedef View<select id="targetViewSelect"></select></label>
+              <label>Iliski Adi<input id="relationName" placeholder="customer_order_to_lines" required></label>
+              <h2>Kolon Eslesmeleri</h2>
               <div id="relationColumns" class="relation-columns"></div>
+              <details class="advanced">
+                <summary>Gelismis ayarlar</summary>
+                <div class="advanced-body">
+                  <label>Join Tipi
+                    <select id="joinType">
+                      <option>INNER JOIN</option>
+                      <option>LEFT JOIN</option>
+                      <option>RIGHT JOIN</option>
+                      <option>FULL JOIN</option>
+                    </select>
+                  </label>
+                  <label>Aciklama<textarea id="relationDescriptionTr" placeholder="Relation aciklamasi"></textarea></label>
+                  <div class="check-row"><label><input id="relationIsActive" type="checkbox" checked> Aktif</label></div>
+                </div>
+              </details>
               <div class="button-row">
                 <button id="addRelationColumnButton" class="secondary" type="button">Eslesme Ekle</button>
                 <button class="primary" type="submit">Kaydet</button>
@@ -903,12 +932,12 @@ static string BuildAdminAppPage(AuthenticatedUser session, string activePage)
           </div>
           <div class="section">
             <div class="toolbar">
-              <h2>Relations</h2>
+              <h2>Iliski Listesi</h2>
               <button id="refreshRelationsButton" class="secondary" type="button">Yenile</button>
             </div>
             <div class="table-wrap">
               <table>
-                <thead><tr><th>relation_name</th><th>source</th><th>target</th><th>join</th><th>active</th></tr></thead>
+                <thead><tr><th>Iliski Adi</th><th>Kaynak</th><th>Hedef</th><th>Join</th><th>Durum</th></tr></thead>
                 <tbody id="relationsBody"></tbody>
               </table>
             </div>
@@ -924,6 +953,7 @@ static string BuildAdminAppPage(AuthenticatedUser session, string activePage)
     let views = [];
     let columns = [];
     let relations = [];
+    const relationColumnCache = new Map();
 
     if (!token) {
       window.location.href = '/admin';
@@ -981,6 +1011,41 @@ static string BuildAdminAppPage(AuthenticatedUser session, string activePage)
       return String(value || '').slice(0, 8);
     }
 
+    function statusBadge(isActive) {
+      return `<span class="status ${isActive ? 'active' : 'passive'}">${isActive ? 'Aktif' : 'Pasif'}</span>`;
+    }
+
+    function optionLabelForColumn(column) {
+      const label = column.displayNameTr || column.columnName;
+      return label === column.columnName ? column.columnName : `${label} (${column.columnName})`;
+    }
+
+    function relationNamePart(viewId) {
+      const view = views.find(item => item.viewId === viewId);
+      return (view?.viewName || '')
+        .toLowerCase()
+        .replace(/[^a-z0-9_]/g, '_')
+        .replace(/_+/g, '_')
+        .replace(/^_+|_+$/g, '');
+    }
+
+    function updateRelationNameSuggestion() {
+      const input = document.getElementById('relationName');
+      if (!input || (input.value.trim() && input.dataset.autogenerated !== 'true')) return;
+      const source = relationNamePart(value('sourceViewSelect'));
+      const target = relationNamePart(value('targetViewSelect'));
+      if (source && target) {
+        input.value = `${source}_to_${target}`;
+        input.dataset.autogenerated = 'true';
+      }
+    }
+
+    function markSelectedRows(selector, dataKey, value) {
+      for (const row of document.querySelectorAll(selector)) {
+        row.classList.toggle('is-selected', row.dataset[dataKey] === String(value || ''));
+      }
+    }
+
     function showPage(page) {
       for (const id of ['viewsPage', 'columnsPage', 'relationsPage']) {
         const section = document.getElementById(id);
@@ -1003,8 +1068,8 @@ static string BuildAdminAppPage(AuthenticatedUser session, string activePage)
           <td class="mono">${shortId(view.viewId)}</td>
           <td class="mono">${escapeHtml(view.viewName)}</td>
           <td>${escapeHtml(view.displayNameTr)}</td>
-          <td>${view.isActive ? 'true' : 'false'}</td>
-          <td><button class="secondary" type="button" data-toggle-id="${view.viewId}">${view.isActive ? 'Pasif Yap' : 'Aktif Yap'}</button></td>
+          <td>${statusBadge(view.isActive)}</td>
+          <td><button class="secondary" type="button" data-toggle-id="${view.viewId}">${view.isActive ? 'Pasife Al' : 'Aktif Yap'}</button></td>
         </tr>
       `).join('');
 
@@ -1030,6 +1095,7 @@ static string BuildAdminAppPage(AuthenticatedUser session, string activePage)
       document.getElementById('viewDisplayNameTr').value = view.displayNameTr || '';
       document.getElementById('viewDescriptionTr').value = view.descriptionTr || '';
       document.getElementById('viewIsActive').checked = view.isActive;
+      markSelectedRows('#viewsBody tr', 'viewId', view.viewId);
     }
 
     function clearViewForm() {
@@ -1038,6 +1104,7 @@ static string BuildAdminAppPage(AuthenticatedUser session, string activePage)
       document.getElementById('viewDisplayNameTr').value = '';
       document.getElementById('viewDescriptionTr').value = '';
       document.getElementById('viewIsActive').checked = true;
+      markSelectedRows('#viewsBody tr', 'viewId', '');
       setMessage('viewMessage', '', '');
     }
 
@@ -1080,8 +1147,8 @@ static string BuildAdminAppPage(AuthenticatedUser session, string activePage)
           <td class="mono">${escapeHtml(column.columnName)}</td>
           <td>${escapeHtml(column.displayNameTr)}</td>
           <td>${escapeHtml(column.dataType)}</td>
-          <td>${column.isActive ? 'true' : 'false'}</td>
-          <td><button class="secondary" type="button" data-column-toggle="${escapeHtml(column.columnName)}">${column.isActive ? 'Pasif Yap' : 'Aktif Yap'}</button></td>
+          <td>${statusBadge(column.isActive)}</td>
+          <td><button class="secondary" type="button" data-column-toggle="${escapeHtml(column.columnName)}">${column.isActive ? 'Pasife Al' : 'Aktif Yap'}</button></td>
         </tr>
       `).join('');
 
@@ -1122,6 +1189,12 @@ static string BuildAdminAppPage(AuthenticatedUser session, string activePage)
           select.value = selected;
         }
       }
+      const sourceSelect = document.getElementById('sourceViewSelect');
+      const targetSelect = document.getElementById('targetViewSelect');
+      if (sourceSelect && targetSelect && sourceSelect.value === targetSelect.value && views.length > 1) {
+        targetSelect.value = views[1].viewId;
+      }
+      updateRelationNameSuggestion();
     }
 
     function editColumn(column) {
@@ -1134,6 +1207,7 @@ static string BuildAdminAppPage(AuthenticatedUser session, string activePage)
       document.getElementById('columnGroupableInput').checked = !!column.isGroupable;
       document.getElementById('columnSummableInput').checked = !!column.isSummable;
       document.getElementById('columnActiveInput').checked = !!column.isActive;
+      markSelectedRows('#columnsBody tr', 'columnName', column.columnName);
     }
 
     function clearColumnForm() {
@@ -1145,6 +1219,7 @@ static string BuildAdminAppPage(AuthenticatedUser session, string activePage)
       document.getElementById('columnGroupableInput').checked = true;
       document.getElementById('columnSummableInput').checked = false;
       document.getElementById('columnActiveInput').checked = true;
+      markSelectedRows('#columnsBody tr', 'columnName', '');
       setMessage('columnsMessage', '', '');
     }
 
@@ -1178,44 +1253,98 @@ static string BuildAdminAppPage(AuthenticatedUser session, string activePage)
       });
     }
 
+    async function getColumnsForView(viewId) {
+      if (!viewId) return [];
+      if (relationColumnCache.has(viewId)) return relationColumnCache.get(viewId);
+      const viewColumns = await api(`/admin/api/view-columns?viewId=${encodeURIComponent(viewId)}`);
+      relationColumnCache.set(viewId, viewColumns);
+      return viewColumns;
+    }
+
+    function relationColumnOptions(viewId, selectedValue) {
+      const viewColumns = relationColumnCache.get(viewId) || [];
+      const selected = selectedValue || '';
+      const options = viewColumns.map(column => `
+        <option value="${escapeHtml(column.columnName)}" ${column.columnName === selected ? 'selected' : ''}>${escapeHtml(optionLabelForColumn(column))}</option>
+      `).join('');
+      const hasSelected = !selected || viewColumns.some(column => column.columnName === selected);
+      const fallback = selected && !hasSelected
+        ? `<option value="${escapeHtml(selected)}" selected>${escapeHtml(selected)}</option>`
+        : '';
+      return `<option value="">Secin</option>${fallback}${options}`;
+    }
+
+    async function refreshRelationColumnOptions() {
+      const sourceViewId = value('sourceViewSelect');
+      const targetViewId = value('targetViewSelect');
+      await Promise.all([getColumnsForView(sourceViewId), getColumnsForView(targetViewId)]);
+      for (const row of document.querySelectorAll('.relation-column-row')) {
+        const sourceSelect = row.querySelector('[data-field="sourceColumnName"]');
+        const targetSelect = row.querySelector('[data-field="targetColumnName"]');
+        const sourceValue = sourceSelect.value;
+        const targetValue = targetSelect.value;
+        sourceSelect.innerHTML = relationColumnOptions(sourceViewId, sourceValue);
+        targetSelect.innerHTML = relationColumnOptions(targetViewId, targetValue);
+      }
+    }
+
+    async function relationViewsChanged() {
+      updateRelationNameSuggestion();
+      await refreshRelationColumnOptions();
+    }
+
     function addRelationColumnRow(column = {}) {
       const row = document.createElement('div');
       row.className = 'relation-column-row';
+      const sourceViewId = value('sourceViewSelect');
+      const targetViewId = value('targetViewSelect');
       row.innerHTML = `
-        <label>ordinal<input data-field="ordinal" type="number" min="1" value="${column.ordinal || document.querySelectorAll('.relation-column-row').length + 1}"></label>
-        <label>source_column_name<input data-field="sourceColumnName" value="${escapeHtml(column.sourceColumnName || '')}" placeholder="order_no"></label>
+        <label>Sira<input data-field="ordinal" type="number" min="1" value="${column.ordinal || document.querySelectorAll('.relation-column-row').length + 1}"></label>
+        <label>Kaynak Kolon<select data-field="sourceColumnName">${relationColumnOptions(sourceViewId, column.sourceColumnName || '')}</select></label>
         <span class="equals">=</span>
-        <label>target_column_name<input data-field="targetColumnName" value="${escapeHtml(column.targetColumnName || '')}" placeholder="order_no"></label>
-        <button class="icon" type="button">X</button>
+        <label>Hedef Kolon<select data-field="targetColumnName">${relationColumnOptions(targetViewId, column.targetColumnName || '')}</select></label>
+        <button class="icon" type="button">Sil</button>
       `;
       row.querySelector('button').addEventListener('click', () => {
         if (document.querySelectorAll('.relation-column-row').length > 1) row.remove();
       });
       document.getElementById('relationColumns').appendChild(row);
+      refreshRelationColumnOptions().catch(error => console.error(error));
     }
 
     function clearRelationForm() {
       document.getElementById('relationId').value = '';
-      document.getElementById('relationName').value = '';
+      const relationNameInput = document.getElementById('relationName');
+      relationNameInput.value = '';
+      relationNameInput.dataset.autogenerated = 'true';
+      if (views.length > 1) {
+        document.getElementById('targetViewSelect').value = views[1].viewId;
+      }
+      updateRelationNameSuggestion();
       document.getElementById('joinType').value = 'INNER JOIN';
       document.getElementById('relationDescriptionTr').value = '';
       document.getElementById('relationIsActive').checked = true;
       document.getElementById('relationColumns').innerHTML = '';
-      addRelationColumnRow({ sourceColumnName: 'id', targetColumnName: 'id', ordinal: 1 });
+      addRelationColumnRow({ ordinal: 1 });
+      markSelectedRows('#relationsBody tr', 'relationId', '');
       setMessage('relationMessage', '', '');
     }
 
-    function editRelation(relation) {
+    async function editRelation(relation) {
       if (!relation) return;
       document.getElementById('relationId').value = relation.relationId;
       document.getElementById('relationName').value = relation.relationName;
+      document.getElementById('relationName').dataset.autogenerated = 'false';
       document.getElementById('sourceViewSelect').value = relation.sourceViewId;
       document.getElementById('targetViewSelect').value = relation.targetViewId;
       document.getElementById('joinType').value = relation.joinType;
       document.getElementById('relationDescriptionTr').value = relation.descriptionTr || '';
       document.getElementById('relationIsActive').checked = relation.isActive;
+      await refreshRelationColumnOptions();
       document.getElementById('relationColumns').innerHTML = '';
       for (const column of relation.columns) addRelationColumnRow(column);
+      await refreshRelationColumnOptions();
+      markSelectedRows('#relationsBody tr', 'relationId', relation.relationId);
     }
 
     async function loadRelations() {
@@ -1226,12 +1355,18 @@ static string BuildAdminAppPage(AuthenticatedUser session, string activePage)
           <td class="mono">${escapeHtml(relation.sourceViewName)}</td>
           <td class="mono">${escapeHtml(relation.targetViewName)}</td>
           <td>${escapeHtml(relation.joinType)}</td>
-          <td>${relation.isActive ? 'true' : 'false'}</td>
+          <td>${statusBadge(relation.isActive)}</td>
         </tr>
       `).join('');
 
       for (const row of document.querySelectorAll('#relationsBody tr')) {
-        row.addEventListener('click', () => editRelation(relations.find(relation => relation.relationId === row.dataset.relationId)));
+        row.addEventListener('click', () => {
+          editRelation(relations.find(relation => relation.relationId === row.dataset.relationId))
+            .catch(error => {
+              console.error(error);
+              setMessage('relationMessage', 'error', error.message || String(error));
+            });
+        });
       }
     }
 
@@ -1261,7 +1396,7 @@ static string BuildAdminAppPage(AuthenticatedUser session, string activePage)
       });
       setMessage('relationMessage', 'ok', `${saved.relationName} kaydedildi.`);
       await loadRelations();
-      editRelation(saved);
+      await editRelation(saved);
     }
 
     document.getElementById('logoutButton').addEventListener('click', () => {
@@ -1275,6 +1410,11 @@ static string BuildAdminAppPage(AuthenticatedUser session, string activePage)
     document.getElementById('columnForm')?.addEventListener('submit', saveColumn);
     document.getElementById('newColumnButton')?.addEventListener('click', clearColumnForm);
     document.getElementById('refreshColumnsButton')?.addEventListener('click', loadColumnsForSelectedView);
+    document.getElementById('sourceViewSelect')?.addEventListener('change', () => relationViewsChanged().catch(error => setMessage('relationMessage', 'error', error.message || String(error))));
+    document.getElementById('targetViewSelect')?.addEventListener('change', () => relationViewsChanged().catch(error => setMessage('relationMessage', 'error', error.message || String(error))));
+    document.getElementById('relationName')?.addEventListener('input', event => {
+      event.target.dataset.autogenerated = event.target.value.trim() ? 'false' : 'true';
+    });
     document.getElementById('relationForm')?.addEventListener('submit', saveRelation);
     document.getElementById('newRelationButton')?.addEventListener('click', clearRelationForm);
     document.getElementById('addRelationColumnButton')?.addEventListener('click', () => addRelationColumnRow());
