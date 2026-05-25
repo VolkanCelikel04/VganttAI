@@ -18,7 +18,7 @@ Bu workspace sandbox uyumlu lokal Flutter config kullanir:
 ./scripts/flutter.sh run
 ```
 
-Uygulama varsayilan olarak production API'ye baglanir:
+Uygulama varsayilan olarak lokal simulator API'sine baglanir:
 
 ```bash
 ./scripts/flutter.sh run
@@ -27,13 +27,13 @@ Uygulama varsayilan olarak production API'ye baglanir:
 Varsayilan API adresi:
 
 ```text
-https://api.vgantt.com
+http://192.168.1.180:5055
 ```
 
-Lokal API veya mock backend ile calistirmak icin:
+Farkli API veya mock backend ile calistirmak icin:
 
 ```bash
-./scripts/flutter.sh run --dart-define=API_BASE_URL=http://127.0.0.1:5055
+./scripts/flutter.sh run --dart-define=API_BASE_URL=https://api.vgantt.com
 ./scripts/flutter.sh run --dart-define=MOCK_BACKEND=true
 ```
 
@@ -47,6 +47,14 @@ Ses akisi:
 ```text
 Mikrofon -> konusma metne cevrilir -> /assistant/ask -> cevap ekrana yazilir -> cevap sesli okunur
 ```
+
+AI sorgu akisi:
+
+```text
+Soru -> tenant metadata -> guvenli SELECT -> tenant PostgreSQL -> ozet + tablo
+```
+
+`/assistant/ask` sadece SELECT uretir ve admin ekraninda tanimli tablo/view, kolon anlamlari ve iliskileri kullanir. Tarih veya tutar kolonu net degilse SQL calistirmadan once kullaniciya netlestirme sorusu doner.
 
 Telefon ayni yerel agdan bu bilgisayardaki API'ye baglanacaksa bilgisayarin IP adresini kullanin:
 

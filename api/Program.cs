@@ -1,8 +1,10 @@
 using System.Net;
 using System.Net.Sockets;
+using System.Globalization;
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
+using System.Text.RegularExpressions;
 using Npgsql;
 
 LoadLocalEnvFile();
@@ -286,12 +288,7 @@ static async Task<HttpResponseData> RouteAsync(HttpRequestData request)
             return HttpResponseData.Json(HttpStatusCode.BadRequest, new { message = "Question is required." });
         }
 
-        return HttpResponseData.Json(HttpStatusCode.OK, new AssistantResponse(
-            Summary: "Backend calisiyor. AI ve tenant sorgu katmani bir sonraki adimda baglanacak.",
-            Sql: "select now() as server_time",
-            Columns: ["server_time"],
-            Rows: [[DateTimeOffset.UtcNow.ToString("O")]]
-        ));
+        return HttpResponseData.Json(HttpStatusCode.OK, await AnswerAssistantQuestionAsync(session, assistant.Question));
     }
 
     if (request.Method == "GET" && request.Path == "/tenant/db/health")
@@ -4112,6 +4109,991 @@ static string? ReadEnv(params string[] names)
     return null;
 }
 
+static async Task<AssistantResponse> AnswerAssistantQuestionAsync(AuthenticatedUser session, string question)
+{
+    var schema = await LoadAssistantSchemaAsync(session.TenantId);
+    if (schema.Objects.Length == 0)
+    {
+        return AskForClarification("Once admin ekraninda sorgulanacak tablo/view ve kolon anlamlarini tanimlamaliyiz.");
+    }
+
+    var planResult = BuildAssistantQueryPlan(schema, question);
+    if (planResult.Clarification is not null)
+    {
+        return AskForClarification(planResult.Clarification);
+    }
+
+    var plan = planResult.Plan ?? throw new InvalidOperationException("Assistant query plan could not be built.");
+    if (!string.Equals(schema.Connection.Provider, "postgresql", StringComparison.OrdinalIgnoreCase))
+    {
+        return new AssistantResponse(
+            Summary: $"{schema.Connection.Provider} icin SQL olusturdum; bu provider icin sorgu calistirma surucusu henuz eklenmedi.",
+            Sql: plan.Sql,
+            Columns: [],
+            Rows: []
+        );
+    }
+
+    var result = await ExecuteTenantPostgresQueryAsync(schema.Connection, plan.Sql);
+    return new AssistantResponse(
+        Summary: BuildAssistantSummary(plan, result),
+        Sql: plan.Sql,
+        Columns: result.Columns,
+        Rows: result.Rows
+    );
+}
+
+static AssistantResponse AskForClarification(string message)
+{
+    return new AssistantResponse(
+        Summary: message,
+        Sql: string.Empty,
+        Columns: [],
+        Rows: []
+    );
+}
+
+static async Task<AssistantSchema> LoadAssistantSchemaAsync(Guid tenantId)
+{
+    var tenantConnection = await LoadActiveTenantDbConnectionAsync(tenantId)
+        ?? throw new InvalidOperationException("Active tenant database connection is not configured.");
+
+    var objectColumns = new Dictionary<Guid, List<QueryableColumn>>();
+    var objectMap = new Dictionary<Guid, QueryableObjectBuilder>();
+    await using var connection = await OpenRegistryConnectionAsync();
+    await using (var objectCommand = new NpgsqlCommand("""
+        select
+            id,
+            object_name,
+            object_type,
+            business_domain,
+            coalesce(display_name_tr, object_name),
+            coalesce(description_tr, description, '')
+        from tenant_erp_objects
+        where tenant_id = @tenant_id
+          and is_active = true
+          and is_queryable = true
+        order by business_domain, object_name
+        """, connection))
+    {
+        objectCommand.Parameters.AddWithValue("tenant_id", tenantId);
+        await using var reader = await objectCommand.ExecuteReaderAsync();
+        while (await reader.ReadAsync())
+        {
+            var objectId = reader.GetGuid(0);
+            objectMap[objectId] = new QueryableObjectBuilder(
+                ObjectId: objectId,
+                ObjectName: reader.GetString(1),
+                ObjectType: reader.GetString(2),
+                BusinessDomain: reader.GetString(3),
+                DisplayName: reader.GetString(4),
+                Description: reader.GetString(5)
+            );
+            objectColumns[objectId] = [];
+        }
+    }
+
+    await using (var columnCommand = new NpgsqlCommand("""
+        select
+            o.id,
+            c.column_name,
+            coalesce(c.display_name_tr, m.customer_label, c.business_name, c.column_name),
+            coalesce(c.semantic_meaning_tr, m.customer_description, c.description, ''),
+            coalesce(c.data_type, ''),
+            c.is_filterable,
+            c.is_groupable,
+            c.is_summable
+        from tenant_erp_object_columns c
+        join tenant_erp_objects o on o.id = c.object_id
+        left join tenant_erp_column_meanings m
+            on m.column_id = c.id
+           and m.language_code = 'tr'
+        where o.tenant_id = @tenant_id
+          and o.is_active = true
+          and o.is_queryable = true
+          and c.is_active = true
+        order by o.object_name, c.column_name
+        """, connection))
+    {
+        columnCommand.Parameters.AddWithValue("tenant_id", tenantId);
+        await using var reader = await columnCommand.ExecuteReaderAsync();
+        while (await reader.ReadAsync())
+        {
+            var objectId = reader.GetGuid(0);
+            if (!objectColumns.TryGetValue(objectId, out var columns))
+            {
+                continue;
+            }
+
+            columns.Add(new QueryableColumn(
+                ColumnName: reader.GetString(1),
+                DisplayName: reader.GetString(2),
+                SemanticMeaning: reader.GetString(3),
+                DataType: reader.GetString(4),
+                IsFilterable: reader.GetBoolean(5),
+                IsGroupable: reader.GetBoolean(6),
+                IsSummable: reader.GetBoolean(7)
+            ));
+        }
+    }
+
+    var relationMap = new Dictionary<Guid, QueryableRelationBuilder>();
+    await using (var relationCommand = new NpgsqlCommand("""
+        select
+            r.id,
+            r.relation_name,
+            r.source_view_id,
+            source_view.object_name,
+            r.target_view_id,
+            target_view.object_name,
+            r.join_type,
+            coalesce(r.description_tr, ''),
+            rc.source_column_name,
+            rc.target_column_name,
+            coalesce(rc.ordinal, 1)
+        from tenant_erp_relations r
+        join tenant_erp_objects source_view on source_view.id = r.source_view_id
+        join tenant_erp_objects target_view on target_view.id = r.target_view_id
+        left join tenant_erp_relation_columns rc on rc.relation_id = r.id
+        where r.tenant_id = @tenant_id
+          and r.is_active = true
+        order by r.relation_name, rc.ordinal
+        """, connection))
+    {
+        relationCommand.Parameters.AddWithValue("tenant_id", tenantId);
+        await using var reader = await relationCommand.ExecuteReaderAsync();
+        while (await reader.ReadAsync())
+        {
+            var relationId = reader.GetGuid(0);
+            if (!relationMap.TryGetValue(relationId, out var relation))
+            {
+                relation = new QueryableRelationBuilder(
+                    RelationId: relationId,
+                    RelationName: reader.GetString(1),
+                    SourceObjectId: reader.GetGuid(2),
+                    SourceObjectName: reader.GetString(3),
+                    TargetObjectId: reader.GetGuid(4),
+                    TargetObjectName: reader.GetString(5),
+                    JoinType: reader.GetString(6),
+                    Description: reader.GetString(7)
+                );
+                relationMap[relationId] = relation;
+            }
+
+            if (!reader.IsDBNull(8) && !reader.IsDBNull(9))
+            {
+                relation.Columns.Add(new QueryableRelationColumn(
+                    SourceColumnName: reader.GetString(8),
+                    TargetColumnName: reader.GetString(9),
+                    Ordinal: reader.GetInt32(10)
+                ));
+            }
+        }
+    }
+
+    var objects = objectMap.Values
+        .Select(builder => builder.ToObject(objectColumns.GetValueOrDefault(builder.ObjectId, [])))
+        .Where(queryObject => queryObject.Columns.Length > 0)
+        .ToArray();
+    var relations = relationMap.Values
+        .Select(relation => relation.ToRelation())
+        .Where(relation => relation.Columns.Length > 0)
+        .ToArray();
+
+    if (objects.Length == 0 && string.Equals(tenantConnection.Provider, "postgresql", StringComparison.OrdinalIgnoreCase))
+    {
+        return await LoadPostgresAssistantSchemaFromTenantDbAsync(tenantConnection);
+    }
+
+    if (relations.Length == 0 && string.Equals(tenantConnection.Provider, "postgresql", StringComparison.OrdinalIgnoreCase))
+    {
+        relations = await LoadPostgresRelationsFromTenantDbAsync(tenantConnection, objects);
+    }
+
+    return new AssistantSchema(
+        Connection: tenantConnection,
+        Objects: objects,
+        Relations: relations
+    );
+}
+
+static async Task<AssistantSchema> LoadPostgresAssistantSchemaFromTenantDbAsync(TenantDbConnectionSettings tenantConnection)
+{
+    var builders = new Dictionary<string, QueryableObjectBuilder>(StringComparer.OrdinalIgnoreCase);
+    var columns = new Dictionary<Guid, List<QueryableColumn>>();
+    await using var connection = new NpgsqlConnection(BuildTenantConnectionString(tenantConnection));
+    await connection.OpenAsync();
+
+    await using (var objectCommand = new NpgsqlCommand("""
+        select table_schema, table_name, table_type
+        from information_schema.tables
+        where table_schema not in ('pg_catalog', 'information_schema')
+          and table_type in ('BASE TABLE', 'VIEW')
+        order by table_schema, table_name
+        limit 200
+        """, connection))
+    {
+        await using var reader = await objectCommand.ExecuteReaderAsync();
+        while (await reader.ReadAsync())
+        {
+            var schemaName = reader.GetString(0);
+            var tableName = reader.GetString(1);
+            var objectName = BuildPostgresObjectName(schemaName, tableName);
+            var objectId = Guid.NewGuid();
+            builders[$"{schemaName}.{tableName}"] = new QueryableObjectBuilder(
+                ObjectId: objectId,
+                ObjectName: objectName,
+                ObjectType: string.Equals(reader.GetString(2), "VIEW", StringComparison.OrdinalIgnoreCase) ? "view" : "table",
+                BusinessDomain: "discovered",
+                DisplayName: tableName,
+                Description: "Discovered from PostgreSQL information_schema."
+            );
+            columns[objectId] = [];
+        }
+    }
+
+    await using (var columnCommand = new NpgsqlCommand("""
+        select table_schema, table_name, column_name, data_type
+        from information_schema.columns
+        where table_schema not in ('pg_catalog', 'information_schema')
+        order by table_schema, table_name, ordinal_position
+        """, connection))
+    {
+        await using var reader = await columnCommand.ExecuteReaderAsync();
+        while (await reader.ReadAsync())
+        {
+            var key = $"{reader.GetString(0)}.{reader.GetString(1)}";
+            if (!builders.TryGetValue(key, out var builder))
+            {
+                continue;
+            }
+
+            columns[builder.ObjectId].Add(new QueryableColumn(
+                ColumnName: reader.GetString(2),
+                DisplayName: reader.GetString(2),
+                SemanticMeaning: string.Empty,
+                DataType: reader.GetString(3),
+                IsFilterable: true,
+                IsGroupable: true,
+                IsSummable: false
+            ));
+        }
+    }
+
+    var objects = builders.Values
+        .Select(builder => builder.ToObject(columns.GetValueOrDefault(builder.ObjectId, [])))
+        .Where(queryObject => queryObject.Columns.Length > 0)
+        .ToArray();
+    var relations = await LoadPostgresRelationsFromTenantDbAsync(tenantConnection, objects);
+
+    return new AssistantSchema(tenantConnection, objects, relations);
+}
+
+static async Task<QueryableRelation[]> LoadPostgresRelationsFromTenantDbAsync(
+    TenantDbConnectionSettings tenantConnection,
+    QueryableObject[] objects
+)
+{
+    if (objects.Length == 0)
+    {
+        return [];
+    }
+
+    await using var connection = new NpgsqlConnection(BuildTenantConnectionString(tenantConnection));
+    await connection.OpenAsync();
+    var relationMap = new Dictionary<string, QueryableRelationBuilder>(StringComparer.OrdinalIgnoreCase);
+    await using var command = new NpgsqlCommand("""
+        select
+            tc.constraint_name,
+            child_kcu.table_schema,
+            child_kcu.table_name,
+            child_kcu.column_name,
+            parent_ccu.table_schema,
+            parent_ccu.table_name,
+            parent_ccu.column_name
+        from information_schema.table_constraints tc
+        join information_schema.key_column_usage child_kcu
+          on child_kcu.constraint_catalog = tc.constraint_catalog
+         and child_kcu.constraint_schema = tc.constraint_schema
+         and child_kcu.constraint_name = tc.constraint_name
+        join information_schema.constraint_column_usage parent_ccu
+          on parent_ccu.constraint_catalog = tc.constraint_catalog
+         and parent_ccu.constraint_schema = tc.constraint_schema
+         and parent_ccu.constraint_name = tc.constraint_name
+        where tc.constraint_type = 'FOREIGN KEY'
+          and child_kcu.table_schema not in ('pg_catalog', 'information_schema')
+        order by tc.constraint_name, child_kcu.ordinal_position
+        """, connection);
+
+    await using var reader = await command.ExecuteReaderAsync();
+    while (await reader.ReadAsync())
+    {
+        var relationName = reader.GetString(0);
+        var childObject = FindObjectByPhysicalName(objects, reader.GetString(1), reader.GetString(2));
+        var parentObject = FindObjectByPhysicalName(objects, reader.GetString(4), reader.GetString(5));
+        if (childObject is null || parentObject is null)
+        {
+            continue;
+        }
+
+        var key = $"{parentObject.ObjectId}:{childObject.ObjectId}:{relationName}";
+        if (!relationMap.TryGetValue(key, out var relation))
+        {
+            relation = new QueryableRelationBuilder(
+                RelationId: Guid.NewGuid(),
+                RelationName: relationName,
+                SourceObjectId: parentObject.ObjectId,
+                SourceObjectName: parentObject.ObjectName,
+                TargetObjectId: childObject.ObjectId,
+                TargetObjectName: childObject.ObjectName,
+                JoinType: "INNER JOIN",
+                Description: "Discovered from PostgreSQL foreign key."
+            );
+            relationMap[key] = relation;
+        }
+
+        relation.Columns.Add(new QueryableRelationColumn(
+            SourceColumnName: reader.GetString(6),
+            TargetColumnName: reader.GetString(3),
+            Ordinal: relation.Columns.Count + 1
+        ));
+    }
+
+    return relationMap.Values
+        .Select(relation => relation.ToRelation())
+        .ToArray();
+}
+
+static QueryableObject? FindObjectByPhysicalName(QueryableObject[] objects, string schemaName, string tableName)
+{
+    var fullName = BuildPostgresObjectName(schemaName, tableName);
+    return objects.FirstOrDefault(queryObject =>
+        string.Equals(queryObject.ObjectName, fullName, StringComparison.OrdinalIgnoreCase) ||
+        string.Equals(queryObject.ObjectName, tableName, StringComparison.OrdinalIgnoreCase) ||
+        string.Equals(queryObject.ObjectName, $"{schemaName}.{tableName}", StringComparison.OrdinalIgnoreCase)
+    );
+}
+
+static string BuildPostgresObjectName(string schemaName, string tableName)
+{
+    return string.Equals(schemaName, "public", StringComparison.OrdinalIgnoreCase)
+        ? tableName
+        : $"{schemaName}.{tableName}";
+}
+
+static AssistantPlanResult BuildAssistantQueryPlan(AssistantSchema schema, string question)
+{
+    var normalizedQuestion = NormalizeSearchText(question);
+    var metricKind = DetectAssistantMetricKind(normalizedQuestion);
+    var baseObject = SelectBestQueryableObject(schema.Objects, normalizedQuestion);
+    if (baseObject is null)
+    {
+        return AssistantPlanResult.NeedsClarification("Hangi tablo/view uzerinden sorgulayayim? Admin ekraninda musteri tarafindaki tablo adlarini tanimlayabiliriz.");
+    }
+
+    var dateRange = DetectDateRange(question);
+    var dateSelection = dateRange is null
+        ? null
+        : SelectBestDateColumn(schema, baseObject, normalizedQuestion);
+
+    if (dateRange is not null && dateSelection is null)
+    {
+        return AssistantPlanResult.NeedsClarification(
+            $"Tarih filtresi icin {baseObject.DisplayName} tarafinda hangi kolon kullanilsin? Ornek musteri kolon adi: Olusturma Tarihi."
+        );
+    }
+
+    if (dateRange is null && QuestionImpliesMissingDate(normalizedQuestion))
+    {
+        var candidate = SelectBestDateColumn(schema, baseObject, normalizedQuestion);
+        var label = candidate is null
+            ? "tarih kolonu"
+            : $"{BuildColumnUserLabel(candidate.Column)} ({candidate.Object.DisplayName})";
+        return AssistantPlanResult.NeedsClarification($"Hangi tarih araligini kullanayim? Filtre kolonu olarak {label} gorunuyor.");
+    }
+
+    var metricColumn = metricKind == AssistantMetricKind.Sum
+        ? SelectBestAmountColumn(schema, baseObject, normalizedQuestion)
+        : null;
+    if (metricKind == AssistantMetricKind.Sum && metricColumn is null)
+    {
+        return AssistantPlanResult.NeedsClarification(
+            $"{baseObject.DisplayName} icin hangi tutar kolonunu toplayayim? Admin ekraninda kolonun musteri tarafindaki adini 'Tutar' veya 'Net Tutar' gibi tanimlayabiliriz."
+        );
+    }
+
+    if (metricColumn is not null &&
+        dateSelection is not null &&
+        metricColumn.Object.ObjectId != baseObject.ObjectId &&
+        dateSelection.Object.ObjectId != baseObject.ObjectId &&
+        metricColumn.Object.ObjectId != dateSelection.Object.ObjectId)
+    {
+        return AssistantPlanResult.NeedsClarification("Bu soru icin birden fazla iliski gerekiyor. Hangi tablo iliskisini kullanmam gerektigini netlestirebilir misiniz?");
+    }
+
+    var dialect = SqlDialect.ForProvider(schema.Connection.Provider);
+    var sql = BuildAssistantSql(dialect, baseObject, metricKind, metricColumn, dateSelection, dateRange);
+    return AssistantPlanResult.Ready(new AssistantQueryPlan(
+        Sql: sql,
+        MetricKind: metricKind,
+        BaseObject: baseObject,
+        MetricColumn: metricColumn,
+        DateSelection: dateSelection,
+        DateRange: dateRange
+    ));
+}
+
+static async Task<AssistantQueryResult> ExecuteTenantPostgresQueryAsync(TenantDbConnectionSettings settings, string sql)
+{
+    if (!IsSafeSelectSql(sql))
+    {
+        throw new InvalidOperationException("Only SELECT queries can be executed by the assistant.");
+    }
+
+    await using var connection = new NpgsqlConnection(BuildTenantConnectionString(settings));
+    await connection.OpenAsync();
+    await using var command = new NpgsqlCommand(sql, connection)
+    {
+        CommandTimeout = 30
+    };
+
+    await using var reader = await command.ExecuteReaderAsync();
+    var columns = Enumerable.Range(0, reader.FieldCount)
+        .Select(reader.GetName)
+        .ToArray();
+    var rows = new List<string[]>();
+
+    while (await reader.ReadAsync() && rows.Count < 100)
+    {
+        var row = new string[reader.FieldCount];
+        for (var index = 0; index < reader.FieldCount; index += 1)
+        {
+            row[index] = FormatAssistantValue(reader.IsDBNull(index) ? null : reader.GetValue(index));
+        }
+
+        rows.Add(row);
+    }
+
+    return new AssistantQueryResult(columns, rows.ToArray());
+}
+
+static bool IsSafeSelectSql(string sql)
+{
+    var trimmed = sql.Trim();
+    return trimmed.StartsWith("select ", StringComparison.OrdinalIgnoreCase) &&
+        !trimmed.Contains(';') &&
+        !Regex.IsMatch(trimmed, @"\b(insert|update|delete|drop|alter|truncate|merge|call|execute|grant|revoke)\b", RegexOptions.IgnoreCase);
+}
+
+static string BuildAssistantSql(
+    SqlDialect dialect,
+    QueryableObject baseObject,
+    AssistantMetricKind metricKind,
+    MetricColumnSelection? metricColumn,
+    DateColumnSelection? dateSelection,
+    DateRange? dateRange
+)
+{
+    const string baseAlias = "t0";
+    const string relatedAlias = "t1";
+    var relatedObject = ResolveRelatedObjectForQuery(baseObject, metricColumn, dateSelection);
+    var selectAlias = metricColumn is not null && relatedObject is not null && metricColumn.Object.ObjectId == relatedObject.ObjectId
+        ? relatedAlias
+        : baseAlias;
+    var selectClause = BuildAssistantSelectClause(dialect, baseObject, selectAlias, metricKind, metricColumn);
+    var sql = new StringBuilder();
+    sql.Append("select ");
+    sql.Append(selectClause);
+    sql.AppendLine();
+    sql.Append("from ");
+    sql.Append(dialect.QuoteObjectName(baseObject.ObjectName));
+    sql.Append(' ');
+    sql.Append(dialect.TableAliasSeparator);
+    sql.Append(baseAlias);
+
+    if (relatedObject is not null)
+    {
+        var relation = metricColumn is not null && metricColumn.Object.ObjectId == relatedObject.ObjectId
+            ? metricColumn.Relation
+            : dateSelection?.Relation;
+        if (relation is null)
+        {
+            throw new InvalidOperationException("Related object does not have a relation.");
+        }
+
+        sql.AppendLine();
+        sql.Append(BuildAssistantJoinClause(dialect, baseObject, baseAlias, relatedObject, relation, relatedAlias));
+    }
+
+    if (dateSelection is not null && dateRange is not null)
+    {
+        var dateAlias = relatedObject is not null && dateSelection.Object.ObjectId == relatedObject.ObjectId
+            ? relatedAlias
+            : baseAlias;
+        sql.AppendLine();
+        sql.Append("where ");
+        sql.Append(dialect.QuoteQualified(dateAlias, dateSelection.Column.ColumnName));
+        sql.Append(" >= ");
+        sql.Append(dialect.DateLiteral(dateRange.Start));
+        sql.Append(" and ");
+        sql.Append(dialect.QuoteQualified(dateAlias, dateSelection.Column.ColumnName));
+        sql.Append(" < ");
+        sql.Append(dialect.DateLiteral(dateRange.EndExclusive));
+    }
+
+    if (metricKind == AssistantMetricKind.List)
+    {
+        sql.AppendLine();
+        sql.Append(dialect.LimitClause(20));
+    }
+
+    return sql.ToString();
+}
+
+static string BuildAssistantSelectClause(
+    SqlDialect dialect,
+    QueryableObject baseObject,
+    string selectAlias,
+    AssistantMetricKind metricKind,
+    MetricColumnSelection? metricColumn
+)
+{
+    if (metricKind == AssistantMetricKind.Count)
+    {
+        return $"count(*) as {dialect.QuoteIdentifier(BuildCountAlias(baseObject))}";
+    }
+
+    if (metricKind == AssistantMetricKind.Sum && metricColumn is not null)
+    {
+        return $"coalesce(sum({dialect.QuoteQualified(selectAlias, metricColumn.Column.ColumnName)}), 0) as {dialect.QuoteIdentifier(BuildSumAlias(metricColumn.Column))}";
+    }
+
+    var selectedColumns = baseObject.Columns
+        .Where(column => !LooksSensitive(column))
+        .Take(8)
+        .ToArray();
+
+    if (selectedColumns.Length == 0)
+    {
+        selectedColumns = baseObject.Columns.Take(8).ToArray();
+    }
+
+    return string.Join(", ", selectedColumns.Select(column =>
+        $"{dialect.QuoteQualified(selectAlias, column.ColumnName)} as {dialect.QuoteIdentifier(BuildColumnUserLabel(column))}"
+    ));
+}
+
+static QueryableObject? ResolveRelatedObjectForQuery(
+    QueryableObject baseObject,
+    MetricColumnSelection? metricColumn,
+    DateColumnSelection? dateSelection
+)
+{
+    if (metricColumn is not null && metricColumn.Object.ObjectId != baseObject.ObjectId)
+    {
+        return metricColumn.Object;
+    }
+
+    if (dateSelection is not null && dateSelection.Object.ObjectId != baseObject.ObjectId)
+    {
+        return dateSelection.Object;
+    }
+
+    return null;
+}
+
+static string BuildAssistantJoinClause(
+    SqlDialect dialect,
+    QueryableObject baseObject,
+    string baseAlias,
+    QueryableObject relatedObject,
+    QueryableRelation relation,
+    string relatedAlias
+)
+{
+    var conditions = relation.Columns.Select(column =>
+    {
+        if (relation.SourceObjectId == baseObject.ObjectId && relation.TargetObjectId == relatedObject.ObjectId)
+        {
+            return $"{dialect.QuoteQualified(baseAlias, column.SourceColumnName)} = {dialect.QuoteQualified(relatedAlias, column.TargetColumnName)}";
+        }
+
+        return $"{dialect.QuoteQualified(relatedAlias, column.SourceColumnName)} = {dialect.QuoteQualified(baseAlias, column.TargetColumnName)}";
+    });
+
+    return $"inner join {dialect.QuoteObjectName(relatedObject.ObjectName)} {dialect.TableAliasSeparator}{relatedAlias} on {string.Join(" and ", conditions)}";
+}
+
+static AssistantMetricKind DetectAssistantMetricKind(string normalizedQuestion)
+{
+    if (ContainsAny(normalizedQuestion, "kac", "adet", "sayisi", "sayi", "count"))
+    {
+        return AssistantMetricKind.Count;
+    }
+
+    if (ContainsAny(normalizedQuestion, "tutar", "toplam", "ciro", "bedel", "amount", "total", "ne kadar"))
+    {
+        return AssistantMetricKind.Sum;
+    }
+
+    return AssistantMetricKind.List;
+}
+
+static QueryableObject? SelectBestQueryableObject(QueryableObject[] objects, string normalizedQuestion)
+{
+    var wantsOrder = ContainsAny(normalizedQuestion, "siparis", "order");
+    var wantsLine = ContainsAny(normalizedQuestion, "satir", "kalem", "line", "urun");
+    var wantsSales = ContainsAny(normalizedQuestion, "satis", "sales");
+
+    return objects
+        .Select(queryObject =>
+        {
+            var searchable = BuildObjectSearchText(queryObject);
+            var score = ScoreSearchMatch(normalizedQuestion, searchable);
+            if (wantsOrder && ContainsAny(searchable, "siparis", "order"))
+            {
+                score += 12;
+            }
+
+            if (wantsSales && ContainsAny(searchable, "satis", "sales", "order"))
+            {
+                score += 4;
+            }
+
+            if (wantsLine && ContainsAny(searchable, "line", "satir", "kalem", "detail", "detay"))
+            {
+                score += 10;
+            }
+
+            if (!wantsLine && ContainsAny(searchable, "line", "satir", "kalem", "detail", "detay"))
+            {
+                score -= 4;
+            }
+
+            return new { Object = queryObject, Score = score };
+        })
+        .Where(match => match.Score > 0)
+        .OrderByDescending(match => match.Score)
+        .Select(match => match.Object)
+        .FirstOrDefault();
+}
+
+static DateColumnSelection? SelectBestDateColumn(AssistantSchema schema, QueryableObject baseObject, string normalizedQuestion)
+{
+    var candidates = new List<DateColumnSelection>();
+    candidates.AddRange(baseObject.Columns
+        .Where(IsDateLikeColumn)
+        .Select(column => new DateColumnSelection(baseObject, column, null)));
+
+    foreach (var relation in schema.Relations.Where(relation =>
+        relation.SourceObjectId == baseObject.ObjectId || relation.TargetObjectId == baseObject.ObjectId))
+    {
+        var relatedObjectId = relation.SourceObjectId == baseObject.ObjectId
+            ? relation.TargetObjectId
+            : relation.SourceObjectId;
+        var relatedObject = schema.Objects.FirstOrDefault(queryObject => queryObject.ObjectId == relatedObjectId);
+        if (relatedObject is null)
+        {
+            continue;
+        }
+
+        candidates.AddRange(relatedObject.Columns
+            .Where(IsDateLikeColumn)
+            .Select(column => new DateColumnSelection(relatedObject, column, relation)));
+    }
+
+    return candidates
+        .Select(candidate => new { Candidate = candidate, Score = ScoreDateColumn(candidate.Column, normalizedQuestion) + (candidate.Object.ObjectId == baseObject.ObjectId ? 2 : 0) })
+        .Where(match => match.Score > 0)
+        .OrderByDescending(match => match.Score)
+        .Select(match => match.Candidate)
+        .FirstOrDefault();
+}
+
+static MetricColumnSelection? SelectBestAmountColumn(AssistantSchema schema, QueryableObject baseObject, string normalizedQuestion)
+{
+    var candidates = new List<MetricColumnSelection>();
+    candidates.AddRange(baseObject.Columns
+        .Select(column => new MetricColumnSelection(baseObject, column, null)));
+
+    foreach (var relation in schema.Relations.Where(relation =>
+        relation.SourceObjectId == baseObject.ObjectId || relation.TargetObjectId == baseObject.ObjectId))
+    {
+        var relatedObjectId = relation.SourceObjectId == baseObject.ObjectId
+            ? relation.TargetObjectId
+            : relation.SourceObjectId;
+        var relatedObject = schema.Objects.FirstOrDefault(queryObject => queryObject.ObjectId == relatedObjectId);
+        if (relatedObject is null)
+        {
+            continue;
+        }
+
+        candidates.AddRange(relatedObject.Columns
+            .Select(column => new MetricColumnSelection(relatedObject, column, relation)));
+    }
+
+    return candidates
+        .Select(candidate => new { Candidate = candidate, Score = ScoreAmountColumn(candidate.Column, normalizedQuestion) + (candidate.Object.ObjectId == baseObject.ObjectId ? 2 : 0) })
+        .Where(match => match.Score > 0)
+        .OrderByDescending(match => match.Score)
+        .Select(match => match.Candidate)
+        .FirstOrDefault();
+}
+
+static bool IsDateLikeColumn(QueryableColumn column)
+{
+    var searchable = BuildColumnSearchText(column);
+    return ContainsAny(searchable, "date", "time", "tarih", "created", "create", "olustur", "acilis", "opened") ||
+        ContainsAny(NormalizeSearchText(column.DataType), "date", "time", "timestamp");
+}
+
+static int ScoreDateColumn(QueryableColumn column, string normalizedQuestion)
+{
+    var searchable = BuildColumnSearchText(column);
+    var score = 0;
+    if (ContainsAny(searchable, "date", "time", "tarih"))
+    {
+        score += 4;
+    }
+
+    if (ContainsAny(NormalizeSearchText(column.DataType), "date", "time", "timestamp"))
+    {
+        score += 3;
+    }
+
+    if (ContainsAny(normalizedQuestion, "acilan", "acilmis", "olusturulan", "olusturma", "kayit") &&
+        ContainsAny(searchable, "created", "create", "olustur", "acilis", "opened", "kayit"))
+    {
+        score += 12;
+    }
+
+    if (ContainsAny(normalizedQuestion, "siparis tarihi", "order date") &&
+        ContainsAny(searchable, "siparis", "order"))
+    {
+        score += 7;
+    }
+
+    score += ScoreSearchMatch(normalizedQuestion, searchable);
+    return score;
+}
+
+static int ScoreAmountColumn(QueryableColumn column, string normalizedQuestion)
+{
+    var searchable = BuildColumnSearchText(column);
+    var score = column.IsSummable ? 5 : 0;
+    if (ContainsAny(searchable, "tutar", "amount", "total", "net", "brut", "gross", "price", "bedel", "ciro"))
+    {
+        score += 10;
+    }
+
+    if (ContainsAny(NormalizeSearchText(column.DataType), "numeric", "decimal", "money", "double", "real", "int"))
+    {
+        score += 2;
+    }
+
+    score += ScoreSearchMatch(normalizedQuestion, searchable);
+    return score;
+}
+
+static bool QuestionImpliesMissingDate(string normalizedQuestion)
+{
+    return ContainsAny(normalizedQuestion, "acilan", "acilmis", "olusturulan", "olusturma", "kayit tarihi", "hangi gun", "hangi tarih");
+}
+
+static DateRange? DetectDateRange(string question)
+{
+    var normalizedQuestion = NormalizeSearchText(question);
+    var today = GetConfiguredToday();
+    if (ContainsAny(normalizedQuestion, "bugun", "today"))
+    {
+        return new DateRange(today, today.AddDays(1), "bugun");
+    }
+
+    if (ContainsAny(normalizedQuestion, "dun", "yesterday"))
+    {
+        var yesterday = today.AddDays(-1);
+        return new DateRange(yesterday, today, "dun");
+    }
+
+    if (ContainsAny(normalizedQuestion, "bu ay", "this month"))
+    {
+        var monthStart = new DateOnly(today.Year, today.Month, 1);
+        return new DateRange(monthStart, monthStart.AddMonths(1), "bu ay");
+    }
+
+    if (ContainsAny(normalizedQuestion, "bu hafta", "this week"))
+    {
+        var daysFromMonday = ((int)today.DayOfWeek + 6) % 7;
+        var weekStart = today.AddDays(-daysFromMonday);
+        return new DateRange(weekStart, weekStart.AddDays(7), "bu hafta");
+    }
+
+    var explicitDate = ParseExplicitDate(question);
+    return explicitDate is null
+        ? null
+        : new DateRange(explicitDate.Value, explicitDate.Value.AddDays(1), explicitDate.Value.ToString("yyyy-MM-dd", CultureInfo.InvariantCulture));
+}
+
+static DateOnly GetConfiguredToday()
+{
+    var timeZoneName = Environment.GetEnvironmentVariable("VGANTT_TIME_ZONE") ?? "Europe/Istanbul";
+    TimeZoneInfo timeZone;
+    try
+    {
+        timeZone = TimeZoneInfo.FindSystemTimeZoneById(timeZoneName);
+    }
+    catch (TimeZoneNotFoundException)
+    {
+        timeZone = TimeZoneInfo.Local;
+    }
+    catch (InvalidTimeZoneException)
+    {
+        timeZone = TimeZoneInfo.Local;
+    }
+
+    return DateOnly.FromDateTime(TimeZoneInfo.ConvertTime(DateTimeOffset.UtcNow, timeZone).DateTime);
+}
+
+static DateOnly? ParseExplicitDate(string question)
+{
+    var match = Regex.Match(question, @"\b(?<year>\d{4})-(?<month>\d{1,2})-(?<day>\d{1,2})\b");
+    if (match.Success &&
+        int.TryParse(match.Groups["year"].Value, out var year) &&
+        int.TryParse(match.Groups["month"].Value, out var month) &&
+        int.TryParse(match.Groups["day"].Value, out var day))
+    {
+        return new DateOnly(year, month, day);
+    }
+
+    match = Regex.Match(question, @"\b(?<day>\d{1,2})[./](?<month>\d{1,2})[./](?<year>\d{4})\b");
+    if (match.Success &&
+        int.TryParse(match.Groups["year"].Value, out year) &&
+        int.TryParse(match.Groups["month"].Value, out month) &&
+        int.TryParse(match.Groups["day"].Value, out day))
+    {
+        return new DateOnly(year, month, day);
+    }
+
+    return null;
+}
+
+static string BuildAssistantSummary(AssistantQueryPlan plan, AssistantQueryResult result)
+{
+    var objectLabel = string.IsNullOrWhiteSpace(plan.BaseObject.DisplayName)
+        ? plan.BaseObject.ObjectName
+        : plan.BaseObject.DisplayName;
+    var dateLabel = plan.DateRange is null ? string.Empty : $"{plan.DateRange.Label} icin ";
+    var firstValue = result.Rows.Length > 0 && result.Rows[0].Length > 0 ? result.Rows[0][0] : "0";
+
+    return plan.MetricKind switch
+    {
+        AssistantMetricKind.Count => $"{dateLabel}{objectLabel} adedi: {firstValue}.",
+        AssistantMetricKind.Sum => $"{dateLabel}{objectLabel} toplami: {firstValue}.",
+        _ => $"{objectLabel} icin {result.Rows.Length} satir sonuc geldi."
+    };
+}
+
+static string FormatAssistantValue(object? value)
+{
+    return value switch
+    {
+        null => string.Empty,
+        DateTime dateTime => dateTime.ToString("yyyy-MM-dd HH:mm:ss", CultureInfo.InvariantCulture),
+        DateOnly dateOnly => dateOnly.ToString("yyyy-MM-dd", CultureInfo.InvariantCulture),
+        decimal decimalValue => decimalValue.ToString("0.##", CultureInfo.InvariantCulture),
+        double doubleValue => doubleValue.ToString("0.##", CultureInfo.InvariantCulture),
+        float floatValue => floatValue.ToString("0.##", CultureInfo.InvariantCulture),
+        _ => Convert.ToString(value, CultureInfo.InvariantCulture) ?? string.Empty
+    };
+}
+
+static string BuildObjectSearchText(QueryableObject queryObject)
+{
+    return NormalizeSearchText($"{queryObject.ObjectName} {queryObject.DisplayName} {queryObject.Description} {queryObject.BusinessDomain}");
+}
+
+static string BuildColumnSearchText(QueryableColumn column)
+{
+    return NormalizeSearchText($"{column.ColumnName} {column.DisplayName} {column.SemanticMeaning} {column.DataType}");
+}
+
+static string BuildColumnUserLabel(QueryableColumn column)
+{
+    if (!string.IsNullOrWhiteSpace(column.DisplayName))
+    {
+        return column.DisplayName;
+    }
+
+    return column.ColumnName;
+}
+
+static string BuildCountAlias(QueryableObject queryObject)
+{
+    var label = NormalizeSearchText(queryObject.DisplayName);
+    return ContainsAny(label, "siparis", "order") ? "siparis_adedi" : "adet";
+}
+
+static string BuildSumAlias(QueryableColumn column)
+{
+    var label = NormalizeSearchText(BuildColumnUserLabel(column)).Replace(' ', '_');
+    return string.IsNullOrWhiteSpace(label) ? "toplam" : $"toplam_{label}";
+}
+
+static bool LooksSensitive(QueryableColumn column)
+{
+    return ContainsAny(BuildColumnSearchText(column), "password", "sifre", "token", "secret", "hash");
+}
+
+static int ScoreSearchMatch(string normalizedQuestion, string searchable)
+{
+    var score = 0;
+    foreach (var token in normalizedQuestion.Split(' ', StringSplitOptions.RemoveEmptyEntries).Where(token => token.Length > 2))
+    {
+        if (searchable.Contains(token, StringComparison.Ordinal))
+        {
+            score += token.Length > 4 ? 2 : 1;
+        }
+    }
+
+    return score;
+}
+
+static bool ContainsAny(string text, params string[] values)
+{
+    return values.Any(value => text.Contains(value, StringComparison.OrdinalIgnoreCase));
+}
+
+static string NormalizeSearchText(string value)
+{
+    var lower = value
+        .Replace('İ', 'i')
+        .Replace('I', 'i')
+        .Replace('ı', 'i')
+        .Replace('Ş', 's')
+        .Replace('ş', 's')
+        .Replace('Ğ', 'g')
+        .Replace('ğ', 'g')
+        .Replace('Ü', 'u')
+        .Replace('ü', 'u')
+        .Replace('Ö', 'o')
+        .Replace('ö', 'o')
+        .Replace('Ç', 'c')
+        .Replace('ç', 'c')
+        .ToLowerInvariant();
+    var builder = new StringBuilder();
+    foreach (var character in lower.Normalize(NormalizationForm.FormD))
+    {
+        if (CharUnicodeInfo.GetUnicodeCategory(character) == UnicodeCategory.NonSpacingMark)
+        {
+            continue;
+        }
+
+        builder.Append(char.IsLetterOrDigit(character) ? character : ' ');
+    }
+
+    return Regex.Replace(builder.ToString(), @"\s+", " ").Trim();
+}
+
 static async Task<Guid> UpsertErpObjectAsync(
     NpgsqlConnection connection,
     NpgsqlTransaction transaction,
@@ -4803,6 +5785,214 @@ sealed record AssistantResponse(
     string[] Columns,
     string[][] Rows
 );
+
+enum AssistantMetricKind
+{
+    Count,
+    Sum,
+    List
+}
+
+sealed record AssistantSchema(
+    TenantDbConnectionSettings Connection,
+    QueryableObject[] Objects,
+    QueryableRelation[] Relations
+);
+
+sealed record QueryableObject(
+    Guid ObjectId,
+    string ObjectName,
+    string ObjectType,
+    string BusinessDomain,
+    string DisplayName,
+    string Description,
+    QueryableColumn[] Columns
+);
+
+sealed record QueryableColumn(
+    string ColumnName,
+    string DisplayName,
+    string SemanticMeaning,
+    string DataType,
+    bool IsFilterable,
+    bool IsGroupable,
+    bool IsSummable
+);
+
+sealed record QueryableRelation(
+    Guid RelationId,
+    string RelationName,
+    Guid SourceObjectId,
+    string SourceObjectName,
+    Guid TargetObjectId,
+    string TargetObjectName,
+    string JoinType,
+    string Description,
+    QueryableRelationColumn[] Columns
+);
+
+sealed record QueryableRelationColumn(
+    string SourceColumnName,
+    string TargetColumnName,
+    int Ordinal
+);
+
+sealed record QueryableObjectBuilder(
+    Guid ObjectId,
+    string ObjectName,
+    string ObjectType,
+    string BusinessDomain,
+    string DisplayName,
+    string Description
+)
+{
+    public QueryableObject ToObject(List<QueryableColumn> columns)
+    {
+        return new QueryableObject(
+            ObjectId,
+            ObjectName,
+            ObjectType,
+            BusinessDomain,
+            DisplayName,
+            Description,
+            columns.ToArray()
+        );
+    }
+}
+
+sealed record QueryableRelationBuilder(
+    Guid RelationId,
+    string RelationName,
+    Guid SourceObjectId,
+    string SourceObjectName,
+    Guid TargetObjectId,
+    string TargetObjectName,
+    string JoinType,
+    string Description
+)
+{
+    public List<QueryableRelationColumn> Columns { get; } = [];
+
+    public QueryableRelation ToRelation()
+    {
+        return new QueryableRelation(
+            RelationId,
+            RelationName,
+            SourceObjectId,
+            SourceObjectName,
+            TargetObjectId,
+            TargetObjectName,
+            JoinType,
+            Description,
+            Columns.OrderBy(column => column.Ordinal).ToArray()
+        );
+    }
+}
+
+sealed record DateColumnSelection(
+    QueryableObject Object,
+    QueryableColumn Column,
+    QueryableRelation? Relation
+);
+
+sealed record MetricColumnSelection(
+    QueryableObject Object,
+    QueryableColumn Column,
+    QueryableRelation? Relation
+);
+
+sealed record DateRange(
+    DateOnly Start,
+    DateOnly EndExclusive,
+    string Label
+);
+
+sealed record AssistantQueryPlan(
+    string Sql,
+    AssistantMetricKind MetricKind,
+    QueryableObject BaseObject,
+    MetricColumnSelection? MetricColumn,
+    DateColumnSelection? DateSelection,
+    DateRange? DateRange
+);
+
+sealed record AssistantQueryResult(
+    string[] Columns,
+    string[][] Rows
+);
+
+sealed record AssistantPlanResult(
+    AssistantQueryPlan? Plan,
+    string? Clarification
+)
+{
+    public static AssistantPlanResult Ready(AssistantQueryPlan plan)
+    {
+        return new AssistantPlanResult(plan, null);
+    }
+
+    public static AssistantPlanResult NeedsClarification(string clarification)
+    {
+        return new AssistantPlanResult(null, clarification);
+    }
+}
+
+sealed record SqlDialect(
+    string Provider,
+    string IdentifierOpen,
+    string IdentifierClose,
+    string TableAliasSeparator
+)
+{
+    public static SqlDialect ForProvider(string provider)
+    {
+        return provider.Trim().ToLowerInvariant() switch
+        {
+            "mysql" => new SqlDialect(provider, "`", "`", ""),
+            "sqlserver" => new SqlDialect(provider, "[", "]", "as "),
+            "oracle" => new SqlDialect(provider, "\"", "\"", ""),
+            _ => new SqlDialect(provider, "\"", "\"", "as ")
+        };
+    }
+
+    public string QuoteObjectName(string objectName)
+    {
+        return string.Join(".", objectName.Split('.', StringSplitOptions.RemoveEmptyEntries).Select(QuoteIdentifier));
+    }
+
+    public string QuoteQualified(string alias, string columnName)
+    {
+        return $"{alias}.{QuoteIdentifier(columnName)}";
+    }
+
+    public string QuoteIdentifier(string value)
+    {
+        var escaped = IdentifierClose == "]"
+            ? value.Replace("]", "]]")
+            : value.Replace(IdentifierClose, IdentifierClose + IdentifierClose);
+        return $"{IdentifierOpen}{escaped}{IdentifierClose}";
+    }
+
+    public string DateLiteral(DateOnly date)
+    {
+        var value = date.ToString("yyyy-MM-dd", CultureInfo.InvariantCulture);
+        return Provider.Trim().ToLowerInvariant() switch
+        {
+            "sqlserver" => $"cast('{value}' as date)",
+            _ => $"date '{value}'"
+        };
+    }
+
+    public string LimitClause(int count)
+    {
+        return Provider.Trim().ToLowerInvariant() switch
+        {
+            "oracle" => $"fetch first {count} rows only",
+            "sqlserver" => string.Empty,
+            _ => $"limit {count}"
+        };
+    }
+}
 
 sealed record TenantDbConnectionSettings(
     string Provider,

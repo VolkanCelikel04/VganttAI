@@ -392,7 +392,7 @@ class _AssistantScreenState extends State<AssistantScreen> {
       );
 
       setState(() {
-        _latestAnswer = answer;
+        _latestAnswer = answer.sql.trim().isEmpty ? null : answer;
         _messages.add(
           _ChatMessage(role: _MessageRole.assistant, text: answer.summary),
         );
