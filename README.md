@@ -51,7 +51,7 @@ Mikrofon -> konusma metne cevrilir -> /assistant/ask -> cevap ekrana yazilir -> 
 Telefon ayni yerel agdan bu bilgisayardaki API'ye baglanacaksa bilgisayarin IP adresini kullanin:
 
 ```bash
-./scripts/flutter.sh run --dart-define=API_BASE_URL=http://192.168.1.180:5055
+./scripts/flutter.sh run --dart-define=API_BASE_URL=http://API_PC_LAN_IP:5055
 ```
 
 ## API
@@ -64,6 +64,13 @@ Backend PostgreSQL baglantisini ortam degiskeninden okur. Yerel server kurulumun
 VGANTT_REGISTRY_CONNECTION="Host=localhost;Port=5432;Database=vgantt_db;Username=vganttuser;Password=DB_PASSWORD;SSL Mode=Disable"
 VGANTT_API_BIND_HOST=0.0.0.0
 VGANTT_API_PORT=5055
+VGANTT_TENANT_DB_PROVIDER=postgresql
+VGANTT_TENANT_DB_HOST=10.0.1.46
+VGANTT_TENANT_DB_PORT=5432
+VGANTT_TENANT_DB_NAME=ERP_DB_NAME
+VGANTT_TENANT_DB_USERNAME=ERP_DB_USER
+VGANTT_TENANT_DB_PASSWORD=ERP_DB_PASSWORD
+VGANTT_TENANT_DB_SSL_MODE=Disable
 ```
 
 Migration ve ilk admin kullanicisi:
@@ -80,4 +87,17 @@ Kontrol:
 ```bash
 curl http://127.0.0.1:5055/health
 curl http://127.0.0.1:5055/db/health
+```
+
+Tenant/ERP PostgreSQL kontrolu icin once mobil veya admin login ile token alin, sonra:
+
+```bash
+curl -H "Authorization: Bearer TOKEN" http://127.0.0.1:5055/tenant/db/health
+```
+
+Telefon ayni agdayken mobil uygulama API bilgisayarinin LAN IP adresine baglanir. Ornek:
+
+```bash
+cd mobile
+../scripts/flutter.sh run --dart-define=API_BASE_URL=http://API_PC_LAN_IP:5055
 ```

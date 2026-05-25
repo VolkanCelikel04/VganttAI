@@ -294,6 +294,28 @@ static async Task<HttpResponseData> RouteAsync(HttpRequestData request)
         ));
     }
 
+    if (request.Method == "GET" && request.Path == "/tenant/db/health")
+    {
+        var session = await ValidateAccessTokenAsync(request.BearerToken);
+        if (session is null)
+        {
+            return HttpResponseData.Json(HttpStatusCode.Unauthorized, new { message = "Invalid or expired session." });
+        }
+
+        try
+        {
+            return HttpResponseData.Json(HttpStatusCode.OK, await CheckTenantDbHealthAsync(session.TenantId));
+        }
+        catch (InvalidOperationException error)
+        {
+            return HttpResponseData.Json(HttpStatusCode.BadRequest, new { message = error.Message });
+        }
+        catch (Exception error)
+        {
+            return HttpResponseData.Json(HttpStatusCode.BadGateway, new { message = error.Message });
+        }
+    }
+
     return HttpResponseData.Json(HttpStatusCode.NotFound, new { message = "Not found." });
 }
 
@@ -329,6 +351,22 @@ static async Task<HttpResponseData> RouteAdminApiAsync(HttpRequestData request)
     if (request.Method == "GET" && request.Path == "/admin/api/dashboard")
     {
         return HttpResponseData.Json(HttpStatusCode.OK, await LoadAdminDashboardAsync(session.TenantId));
+    }
+
+    if (request.Method == "GET" && request.Path == "/admin/api/tenant-db-health")
+    {
+        try
+        {
+            return HttpResponseData.Json(HttpStatusCode.OK, await CheckTenantDbHealthAsync(session.TenantId));
+        }
+        catch (InvalidOperationException error)
+        {
+            return HttpResponseData.Json(HttpStatusCode.BadRequest, new { message = error.Message });
+        }
+        catch (Exception error)
+        {
+            return HttpResponseData.Json(HttpStatusCode.BadGateway, new { message = error.Message });
+        }
     }
 
     if (request.Method == "GET" && request.Path == "/admin/api/views")
@@ -2763,7 +2801,68 @@ static async Task SeedAdminAsync()
         await linkCommand.ExecuteNonQueryAsync();
     }
 
+    await SeedTenantDbConnectionAsync(connection, transaction, tenantId);
+
     await transaction.CommitAsync();
+}
+
+static async Task SeedTenantDbConnectionAsync(
+    NpgsqlConnection connection,
+    NpgsqlTransaction transaction,
+    Guid tenantId
+)
+{
+    var tenantConnection = LoadTenantDbConnectionFromEnvironment();
+    if (tenantConnection is null)
+    {
+        return;
+    }
+
+    await using (var deactivateCommand = new NpgsqlCommand("""
+        update tenant_db_connections
+        set is_active = false
+        where tenant_id = @tenant_id
+          and is_active = true
+        """, connection, transaction))
+    {
+        deactivateCommand.Parameters.AddWithValue("tenant_id", tenantId);
+        await deactivateCommand.ExecuteNonQueryAsync();
+    }
+
+    await using var command = new NpgsqlCommand("""
+        insert into tenant_db_connections (
+            tenant_id,
+            provider,
+            host,
+            port,
+            database_name,
+            username,
+            password_value,
+            ssl_mode,
+            is_active
+        )
+        values (
+            @tenant_id,
+            @provider,
+            @host,
+            @port,
+            @database_name,
+            @username,
+            @password_value,
+            @ssl_mode,
+            true
+        )
+        """, connection, transaction);
+
+    command.Parameters.AddWithValue("tenant_id", tenantId);
+    command.Parameters.AddWithValue("provider", tenantConnection.Provider);
+    command.Parameters.AddWithValue("host", tenantConnection.Host);
+    command.Parameters.AddWithValue("port", tenantConnection.Port);
+    command.Parameters.AddWithValue("database_name", tenantConnection.DatabaseName);
+    command.Parameters.AddWithValue("username", tenantConnection.Username);
+    command.Parameters.AddWithValue("password_value", tenantConnection.Password);
+    command.Parameters.AddWithValue("ssl_mode", tenantConnection.SslMode);
+    await command.ExecuteNonQueryAsync();
 }
 
 static async Task<AuthenticatedUser?> AuthenticateAsync(string username, string password)
@@ -3877,6 +3976,142 @@ static async Task<Guid?> GetActiveTenantConnectionIdAsync(
     return value is Guid id ? id : null;
 }
 
+static async Task<TenantDbHealthResponse> CheckTenantDbHealthAsync(Guid tenantId)
+{
+    var settings = await LoadActiveTenantDbConnectionAsync(tenantId);
+    if (settings is null)
+    {
+        throw new InvalidOperationException("Active tenant database connection is not configured.");
+    }
+
+    if (!string.Equals(settings.Provider, "postgresql", StringComparison.OrdinalIgnoreCase))
+    {
+        throw new InvalidOperationException($"Unsupported tenant database provider: {settings.Provider}");
+    }
+
+    var connectionString = BuildTenantConnectionString(settings);
+    await using var connection = new NpgsqlConnection(connectionString);
+    await connection.OpenAsync();
+
+    await using var command = new NpgsqlCommand("select version()", connection);
+    var version = Convert.ToString(await command.ExecuteScalarAsync()) ?? string.Empty;
+
+    return new TenantDbHealthResponse(
+        Status: "ok",
+        Provider: settings.Provider,
+        Host: settings.Host,
+        Port: settings.Port,
+        DatabaseName: settings.DatabaseName,
+        Version: version
+    );
+}
+
+static async Task<TenantDbConnectionSettings?> LoadActiveTenantDbConnectionAsync(Guid tenantId)
+{
+    await using var connection = await OpenRegistryConnectionAsync();
+    await using var command = new NpgsqlCommand("""
+        select provider, host, port, database_name, username, password_value, ssl_mode
+        from tenant_db_connections
+        where tenant_id = @tenant_id
+          and is_active = true
+        order by id desc
+        limit 1
+        """, connection);
+
+    command.Parameters.AddWithValue("tenant_id", tenantId);
+
+    await using var reader = await command.ExecuteReaderAsync();
+    if (!await reader.ReadAsync())
+    {
+        return null;
+    }
+
+    return new TenantDbConnectionSettings(
+        Provider: reader.GetString(0),
+        Host: reader.GetString(1),
+        Port: reader.GetInt32(2),
+        DatabaseName: reader.GetString(3),
+        Username: reader.GetString(4),
+        Password: reader.GetString(5),
+        SslMode: reader.GetString(6)
+    );
+}
+
+static string BuildTenantConnectionString(TenantDbConnectionSettings settings)
+{
+    var builder = new NpgsqlConnectionStringBuilder
+    {
+        Host = settings.Host,
+        Port = settings.Port,
+        Database = settings.DatabaseName,
+        Username = settings.Username,
+        Password = settings.Password,
+        SslMode = ParseNpgsqlSslMode(settings.SslMode),
+        Timeout = 5,
+        CommandTimeout = 5
+    };
+
+    return builder.ConnectionString;
+}
+
+static SslMode ParseNpgsqlSslMode(string value)
+{
+    return value.Trim().ToLowerInvariant() switch
+    {
+        "disable" or "disabled" => SslMode.Disable,
+        "prefer" => SslMode.Prefer,
+        "require" or "required" => SslMode.Require,
+        "verify-ca" or "verifyca" => SslMode.VerifyCA,
+        "verify-full" or "verifyfull" => SslMode.VerifyFull,
+        _ => SslMode.Require
+    };
+}
+
+static TenantDbConnectionSettings? LoadTenantDbConnectionFromEnvironment()
+{
+    var host = ReadEnv("VGANTT_TENANT_DB_HOST", "VGANTT_SEED_TENANT_DB_HOST");
+    var databaseName = ReadEnv("VGANTT_TENANT_DB_NAME", "VGANTT_SEED_TENANT_DB_NAME");
+    var username = ReadEnv("VGANTT_TENANT_DB_USERNAME", "VGANTT_SEED_TENANT_DB_USERNAME");
+    var password = ReadEnv("VGANTT_TENANT_DB_PASSWORD", "VGANTT_SEED_TENANT_DB_PASSWORD");
+
+    if (string.IsNullOrWhiteSpace(host) ||
+        string.IsNullOrWhiteSpace(databaseName) ||
+        string.IsNullOrWhiteSpace(username) ||
+        string.IsNullOrWhiteSpace(password))
+    {
+        return null;
+    }
+
+    var provider = ReadEnv("VGANTT_TENANT_DB_PROVIDER", "VGANTT_SEED_TENANT_DB_PROVIDER") ?? "postgresql";
+    var sslMode = ReadEnv("VGANTT_TENANT_DB_SSL_MODE", "VGANTT_SEED_TENANT_DB_SSL_MODE") ?? "Disable";
+    var portValue = ReadEnv("VGANTT_TENANT_DB_PORT", "VGANTT_SEED_TENANT_DB_PORT");
+    var port = int.TryParse(portValue, out var configuredPort) ? configuredPort : 5432;
+
+    return new TenantDbConnectionSettings(
+        Provider: provider,
+        Host: host,
+        Port: port,
+        DatabaseName: databaseName,
+        Username: username,
+        Password: password,
+        SslMode: sslMode
+    );
+}
+
+static string? ReadEnv(params string[] names)
+{
+    foreach (var name in names)
+    {
+        var value = Environment.GetEnvironmentVariable(name);
+        if (!string.IsNullOrWhiteSpace(value))
+        {
+            return value;
+        }
+    }
+
+    return null;
+}
+
 static async Task<Guid> UpsertErpObjectAsync(
     NpgsqlConnection connection,
     NpgsqlTransaction transaction,
@@ -4567,6 +4802,25 @@ sealed record AssistantResponse(
     string Sql,
     string[] Columns,
     string[][] Rows
+);
+
+sealed record TenantDbConnectionSettings(
+    string Provider,
+    string Host,
+    int Port,
+    string DatabaseName,
+    string Username,
+    string Password,
+    string SslMode
+);
+
+sealed record TenantDbHealthResponse(
+    string Status,
+    string Provider,
+    string Host,
+    int Port,
+    string DatabaseName,
+    string Version
 );
 
 sealed record AdminDashboardResponse(long ViewCount, long ColumnCount, long RelationCount);
