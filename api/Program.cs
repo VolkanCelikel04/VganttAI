@@ -4117,27 +4117,31 @@ static async Task<AssistantResponse> AnswerAssistantQuestionAsync(AuthenticatedU
         return AskForClarification("Once admin ekraninda sorgulanacak tablo/view ve kolon anlamlarini tanimlamaliyiz.");
     }
 
-    var planResult = BuildAssistantQueryPlan(schema, question);
-    if (planResult.Clarification is not null)
+    var aiPlan = await BuildOpenAiSqlPlanAsync(schema, question);
+    if (aiPlan.NeedsClarification)
     {
-        return AskForClarification(planResult.Clarification);
+        return AskForClarification(string.IsNullOrWhiteSpace(aiPlan.ClarificationQuestion)
+            ? "Bu sorguyu olusturmak icin bir bilgi daha gerekli. Hangi tablo, kolon veya tarih araligini kullanmaliyim?"
+            : aiPlan.ClarificationQuestion);
     }
 
-    var plan = planResult.Plan ?? throw new InvalidOperationException("Assistant query plan could not be built.");
+    var sql = aiPlan.Sql.Trim();
+    ValidateAiGeneratedSql(schema, sql);
+
     if (!string.Equals(schema.Connection.Provider, "postgresql", StringComparison.OrdinalIgnoreCase))
     {
         return new AssistantResponse(
-            Summary: $"{schema.Connection.Provider} icin SQL olusturdum; bu provider icin sorgu calistirma surucusu henuz eklenmedi.",
-            Sql: plan.Sql,
+            Summary: $"{schema.Connection.Provider} icin AI SQL olusturdu; bu provider icin sorgu calistirma surucusu henuz eklenmedi.",
+            Sql: sql,
             Columns: [],
             Rows: []
         );
     }
 
-    var result = await ExecuteTenantPostgresQueryAsync(schema.Connection, plan.Sql);
+    var result = await ExecuteTenantPostgresQueryAsync(schema.Connection, sql);
     return new AssistantResponse(
-        Summary: BuildAssistantSummary(plan, result),
-        Sql: plan.Sql,
+        Summary: BuildAiSqlSummary(aiPlan, result),
+        Sql: sql,
         Columns: result.Columns,
         Rows: result.Rows
     );
@@ -4151,6 +4155,392 @@ static AssistantResponse AskForClarification(string message)
         Columns: [],
         Rows: []
     );
+}
+
+static async Task<AiSqlPlan> BuildOpenAiSqlPlanAsync(AssistantSchema schema, string question)
+{
+    var apiKey = Environment.GetEnvironmentVariable("VGANTT_OPENAI_API_KEY");
+    if (string.IsNullOrWhiteSpace(apiKey))
+    {
+        return new AiSqlPlan(
+            NeedsClarification: true,
+            ClarificationQuestion: "AI SQL modeli aktif degil. Server .env icine VGANTT_OPENAI_API_KEY eklenmeli.",
+            Sql: string.Empty,
+            Explanation: "OpenAI API key is missing.",
+            Confidence: 0
+        );
+    }
+
+    var model = Environment.GetEnvironmentVariable("VGANTT_AI_MODEL") ?? "gpt-5-mini";
+    var endpoint = Environment.GetEnvironmentVariable("VGANTT_OPENAI_RESPONSES_URL") ?? "https://api.openai.com/v1/responses";
+    var requestBody = new Dictionary<string, object?>
+    {
+        ["model"] = model,
+        ["instructions"] = BuildAiSqlSystemPrompt(schema.Connection.Provider),
+        ["input"] = BuildAiSqlUserPrompt(schema, question),
+        ["max_output_tokens"] = 1600,
+        ["text"] = new Dictionary<string, object?>
+        {
+            ["format"] = new Dictionary<string, object?>
+            {
+                ["type"] = "json_schema",
+                ["name"] = "vgantt_sql_plan",
+                ["strict"] = true,
+                ["schema"] = BuildAiSqlPlanJsonSchema()
+            }
+        }
+    };
+
+    using var httpClient = new HttpClient
+    {
+        Timeout = TimeSpan.FromSeconds(35)
+    };
+    using var request = new HttpRequestMessage(HttpMethod.Post, endpoint);
+    request.Headers.Authorization = new System.Net.Http.Headers.AuthenticationHeaderValue("Bearer", apiKey);
+    request.Content = new StringContent(JsonSerializer.Serialize(requestBody, AppJson.Options), Encoding.UTF8, "application/json");
+
+    using var response = await httpClient.SendAsync(request);
+    var responseBody = await response.Content.ReadAsStringAsync();
+    if (!response.IsSuccessStatusCode)
+    {
+        throw new InvalidOperationException($"AI model error: {(int)response.StatusCode} {responseBody}");
+    }
+
+    using var document = JsonDocument.Parse(responseBody);
+    var outputText = ExtractOpenAiOutputText(document.RootElement);
+    if (string.IsNullOrWhiteSpace(outputText))
+    {
+        throw new InvalidOperationException("AI model did not return SQL plan text.");
+    }
+
+    var plan = JsonSerializer.Deserialize<AiSqlPlan>(outputText, AppJson.Options)
+        ?? throw new InvalidOperationException("AI SQL plan could not be parsed.");
+    return plan;
+}
+
+static string BuildAiSqlSystemPrompt(string provider)
+{
+    return $"""
+        You are the SQL generation layer for Vgantt ERP AI.
+        You must generate exactly one read-only SELECT query for the given database provider: {provider}.
+        Return only JSON that matches the provided schema.
+
+        Rules:
+        - SQL must be generated by you from the provided schema and user question.
+        - You are responsible for choosing the required joins and aggregate expressions.
+        - Use only tables/views and columns listed in the schema.
+        - Prefer the relationship map for joins. If no mapped relation exists, you may infer a join only when both columns are listed and the relationship is obvious from names/meanings, such as parent.id = child.parent_id or order.id = order_line.order_id.
+        - Never invent table names, column names, unsafe functions, or unclear joins.
+        - Generate only SELECT. No INSERT, UPDATE, DELETE, DROP, ALTER, TRUNCATE, MERGE, CALL, EXECUTE, GRANT, REVOKE.
+        - Do not use SELECT *.
+        - Do not include semicolons or SQL comments.
+        - If the question is ambiguous, set needsClarification=true and ask one short Turkish clarification question.
+        - If a date is mentioned as today/bugun, use the provided current date.
+        - If user asks "kac/adet/sayisi/count", use count(*) unless a distinct business metric is clearly required.
+        - If user asks "toplam/tutar/ciro/ne kadar/sum", use SUM over the best numeric amount column.
+        - If user asks "ortalama/average/avg", use AVG over the best numeric measure column.
+        - If user asks "maksimum/en yuksek/max", use MAX over the best matching measure column, or GROUP BY + ORDER BY desc + limit when asking for the entity with the highest value.
+        - If user asks "minimum/en dusuk/min", use MIN over the best matching measure column, or GROUP BY + ORDER BY asc + limit when asking for the entity with the lowest value.
+        - If user asks "en cok/en az/top N", create GROUP BY, aggregate, ORDER BY, and limit clauses as needed.
+        - If a requested metric lives on a line/detail table, join the header/detail tables using the relationship map or a clear inferred key.
+        - Use Turkish, business-friendly aliases for aggregate columns, such as "toplam_tutar", "ortalama_tutar", "maksimum_tutar", "siparis_adedi".
+        - For PostgreSQL quote identifiers with double quotes and use date 'YYYY-MM-DD'.
+        - For Oracle quote identifiers with double quotes and use date 'YYYY-MM-DD'.
+        - For SQL Server quote identifiers with brackets and use cast('YYYY-MM-DD' as date).
+        - For MySQL quote identifiers with backticks and use date literals as 'YYYY-MM-DD'.
+        - For non-aggregate list queries, limit to at most 100 rows using the provider's syntax.
+        - explanation must be Turkish and concise.
+        """;
+}
+
+static string BuildAiSqlUserPrompt(AssistantSchema schema, string question)
+{
+    var today = GetConfiguredToday();
+    var selectedObjects = SelectObjectsForAiPrompt(schema, question).ToList();
+    var selectedObjectIds = selectedObjects.Select(queryObject => queryObject.ObjectId).ToHashSet();
+    var connectedRelations = schema.Relations
+        .Where(relation => selectedObjectIds.Contains(relation.SourceObjectId) || selectedObjectIds.Contains(relation.TargetObjectId))
+        .Take(120)
+        .ToArray();
+
+    foreach (var relation in connectedRelations)
+    {
+        AddRelatedObjectForAiPrompt(schema, selectedObjects, selectedObjectIds, relation.SourceObjectId);
+        AddRelatedObjectForAiPrompt(schema, selectedObjects, selectedObjectIds, relation.TargetObjectId);
+    }
+
+    var objects = selectedObjects
+        .OrderBy(queryObject => queryObject.BusinessDomain)
+        .ThenBy(queryObject => queryObject.ObjectName)
+        .ToArray();
+    var includedObjectIds = objects.Select(queryObject => queryObject.ObjectId).ToHashSet();
+    var relations = schema.Relations
+        .Where(relation => includedObjectIds.Contains(relation.SourceObjectId) && includedObjectIds.Contains(relation.TargetObjectId))
+        .Take(120)
+        .ToArray();
+
+    var prompt = new StringBuilder();
+    prompt.AppendLine($"Current date: {today:yyyy-MM-dd}");
+    prompt.AppendLine($"Database provider: {schema.Connection.Provider}");
+    prompt.AppendLine($"User question: {question}");
+    prompt.AppendLine();
+    prompt.AppendLine("Schema objects:");
+
+    foreach (var queryObject in objects)
+    {
+        prompt.AppendLine($"- object: {queryObject.ObjectName}");
+        prompt.AppendLine($"  display: {queryObject.DisplayName}");
+        prompt.AppendLine($"  type: {queryObject.ObjectType}");
+        prompt.AppendLine($"  domain: {queryObject.BusinessDomain}");
+        if (!string.IsNullOrWhiteSpace(queryObject.Description))
+        {
+            prompt.AppendLine($"  description: {queryObject.Description}");
+        }
+
+        prompt.AppendLine("  columns:");
+        foreach (var column in queryObject.Columns.Take(80))
+        {
+            var flags = new List<string>();
+            if (column.IsFilterable)
+            {
+                flags.Add("filterable");
+            }
+
+            if (column.IsGroupable)
+            {
+                flags.Add("groupable");
+            }
+
+            if (column.IsSummable)
+            {
+                flags.Add("summable");
+            }
+
+            prompt.Append("    - ");
+            prompt.Append(column.ColumnName);
+            prompt.Append(" | type=");
+            prompt.Append(column.DataType);
+            prompt.Append(" | display=");
+            prompt.Append(column.DisplayName);
+            if (!string.IsNullOrWhiteSpace(column.SemanticMeaning))
+            {
+                prompt.Append(" | meaning=");
+                prompt.Append(column.SemanticMeaning);
+            }
+
+            if (flags.Count > 0)
+            {
+                prompt.Append(" | ");
+                prompt.Append(string.Join(",", flags));
+            }
+
+            prompt.AppendLine();
+        }
+    }
+
+    prompt.AppendLine();
+    prompt.AppendLine("Relationship map:");
+    foreach (var relation in relations)
+    {
+        foreach (var column in relation.Columns)
+        {
+            prompt.AppendLine($"- {relation.SourceObjectName}.{column.SourceColumnName} = {relation.TargetObjectName}.{column.TargetColumnName} ({relation.RelationName})");
+        }
+    }
+
+    return prompt.ToString();
+}
+
+static void AddRelatedObjectForAiPrompt(
+    AssistantSchema schema,
+    List<QueryableObject> objects,
+    HashSet<Guid> objectIds,
+    Guid objectId
+)
+{
+    if (objectIds.Contains(objectId) || objects.Count >= 80)
+    {
+        return;
+    }
+
+    var queryObject = schema.Objects.FirstOrDefault(candidate => candidate.ObjectId == objectId);
+    if (queryObject is null)
+    {
+        return;
+    }
+
+    objects.Add(queryObject);
+    objectIds.Add(objectId);
+}
+
+static QueryableObject[] SelectObjectsForAiPrompt(AssistantSchema schema, string question)
+{
+    if (schema.Objects.Length <= 60)
+    {
+        return schema.Objects;
+    }
+
+    var normalizedQuestion = NormalizeSearchText(question);
+    return schema.Objects
+        .Select(queryObject => new
+        {
+            Object = queryObject,
+            Score = ScoreSearchMatch(normalizedQuestion, BuildObjectSearchText(queryObject)) +
+                queryObject.Columns.Sum(column => Math.Min(4, ScoreSearchMatch(normalizedQuestion, BuildColumnSearchText(column))))
+        })
+        .OrderByDescending(match => match.Score)
+        .ThenBy(match => match.Object.ObjectName)
+        .Take(60)
+        .Select(match => match.Object)
+        .ToArray();
+}
+
+static Dictionary<string, object?> BuildAiSqlPlanJsonSchema()
+{
+    return new Dictionary<string, object?>
+    {
+        ["type"] = "object",
+        ["additionalProperties"] = false,
+        ["properties"] = new Dictionary<string, object?>
+        {
+            ["needsClarification"] = new Dictionary<string, object?> { ["type"] = "boolean" },
+            ["clarificationQuestion"] = new Dictionary<string, object?> { ["type"] = "string" },
+            ["sql"] = new Dictionary<string, object?> { ["type"] = "string" },
+            ["explanation"] = new Dictionary<string, object?> { ["type"] = "string" },
+            ["confidence"] = new Dictionary<string, object?>
+            {
+                ["type"] = "number",
+                ["minimum"] = 0,
+                ["maximum"] = 1
+            }
+        },
+        ["required"] = new[] { "needsClarification", "clarificationQuestion", "sql", "explanation", "confidence" }
+    };
+}
+
+static string? ExtractOpenAiOutputText(JsonElement element)
+{
+    if (element.ValueKind == JsonValueKind.Object)
+    {
+        if (element.TryGetProperty("output_text", out var outputText) && outputText.ValueKind == JsonValueKind.String)
+        {
+            return outputText.GetString();
+        }
+
+        if (element.TryGetProperty("type", out var typeElement) &&
+            typeElement.ValueKind == JsonValueKind.String &&
+            string.Equals(typeElement.GetString(), "output_text", StringComparison.OrdinalIgnoreCase) &&
+            element.TryGetProperty("text", out var textElement) &&
+            textElement.ValueKind == JsonValueKind.String)
+        {
+            return textElement.GetString();
+        }
+
+        foreach (var property in element.EnumerateObject())
+        {
+            var found = ExtractOpenAiOutputText(property.Value);
+            if (!string.IsNullOrWhiteSpace(found))
+            {
+                return found;
+            }
+        }
+    }
+
+    if (element.ValueKind == JsonValueKind.Array)
+    {
+        foreach (var item in element.EnumerateArray())
+        {
+            var found = ExtractOpenAiOutputText(item);
+            if (!string.IsNullOrWhiteSpace(found))
+            {
+                return found;
+            }
+        }
+    }
+
+    return null;
+}
+
+static void ValidateAiGeneratedSql(AssistantSchema schema, string sql)
+{
+    if (!IsSafeSelectSql(sql))
+    {
+        throw new InvalidOperationException("AI only may generate a safe SELECT query.");
+    }
+
+    var referencedObjects = ExtractReferencedSqlObjects(sql);
+    if (referencedObjects.Length == 0)
+    {
+        throw new InvalidOperationException("AI generated SQL does not reference a known object.");
+    }
+
+    var knownObjects = BuildKnownObjectNameSet(schema.Objects);
+    var unknownObjects = referencedObjects
+        .Where(name => !knownObjects.Contains(NormalizeSqlObjectName(name)))
+        .Distinct(StringComparer.OrdinalIgnoreCase)
+        .ToArray();
+    if (unknownObjects.Length > 0)
+    {
+        throw new InvalidOperationException($"AI generated SQL references unknown object(s): {string.Join(", ", unknownObjects)}");
+    }
+}
+
+static string[] ExtractReferencedSqlObjects(string sql)
+{
+    var matches = Regex.Matches(
+        sql,
+        @"\b(?:from|join)\s+(?<object>(?:""[^""]+""|\[[^\]]+\]|`[^`]+`|[A-Za-z_][A-Za-z0-9_]*)(?:\s*\.\s*(?:""[^""]+""|\[[^\]]+\]|`[^`]+`|[A-Za-z_][A-Za-z0-9_]*))?)",
+        RegexOptions.IgnoreCase
+    );
+
+    return matches
+        .Select(match => match.Groups["object"].Value)
+        .Where(value => !string.IsNullOrWhiteSpace(value))
+        .ToArray();
+}
+
+static HashSet<string> BuildKnownObjectNameSet(QueryableObject[] objects)
+{
+    var known = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+    foreach (var queryObject in objects)
+    {
+        var normalized = NormalizeSqlObjectName(queryObject.ObjectName);
+        known.Add(normalized);
+
+        var parts = normalized.Split('.', StringSplitOptions.RemoveEmptyEntries);
+        if (parts.Length > 0)
+        {
+            known.Add(parts[^1]);
+        }
+    }
+
+    return known;
+}
+
+static string NormalizeSqlObjectName(string value)
+{
+    return Regex.Replace(value, @"[""`\[\]\s]", string.Empty).Trim().ToLowerInvariant();
+}
+
+static string BuildAiSqlSummary(AiSqlPlan plan, AssistantQueryResult result)
+{
+    if (result.Rows.Length == 0)
+    {
+        return string.IsNullOrWhiteSpace(plan.Explanation)
+            ? "Sorgu calisti, sonuc bulunamadi."
+            : $"{plan.Explanation} Sonuc bulunamadi.";
+    }
+
+    if (result.Columns.Length == 1 && result.Rows[0].Length == 1)
+    {
+        return string.IsNullOrWhiteSpace(plan.Explanation)
+            ? $"Sonuc: {result.Rows[0][0]}."
+            : $"{plan.Explanation} Sonuc: {result.Rows[0][0]}.";
+    }
+
+    return string.IsNullOrWhiteSpace(plan.Explanation)
+        ? $"{result.Rows.Length} satir sonuc geldi."
+        : $"{plan.Explanation} {result.Rows.Length} satir sonuc geldi.";
 }
 
 static async Task<AssistantSchema> LoadAssistantSchemaAsync(Guid tenantId)
@@ -4481,6 +4871,7 @@ static string BuildPostgresObjectName(string schemaName, string tableName)
         : $"{schemaName}.{tableName}";
 }
 
+#pragma warning disable CS8321
 static AssistantPlanResult BuildAssistantQueryPlan(AssistantSchema schema, string question)
 {
     var normalizedQuestion = NormalizeSearchText(question);
@@ -4580,8 +4971,11 @@ static async Task<AssistantQueryResult> ExecuteTenantPostgresQueryAsync(TenantDb
 static bool IsSafeSelectSql(string sql)
 {
     var trimmed = sql.Trim();
-    return trimmed.StartsWith("select ", StringComparison.OrdinalIgnoreCase) &&
+    return (trimmed.StartsWith("select ", StringComparison.OrdinalIgnoreCase) ||
+            trimmed.StartsWith("with ", StringComparison.OrdinalIgnoreCase)) &&
         !trimmed.Contains(';') &&
+        !trimmed.Contains("--", StringComparison.Ordinal) &&
+        !trimmed.Contains("/*", StringComparison.Ordinal) &&
         !Regex.IsMatch(trimmed, @"\b(insert|update|delete|drop|alter|truncate|merge|call|execute|grant|revoke)\b", RegexOptions.IgnoreCase);
 }
 
@@ -4992,6 +5386,7 @@ static string BuildAssistantSummary(AssistantQueryPlan plan, AssistantQueryResul
         _ => $"{objectLabel} icin {result.Rows.Length} satir sonuc geldi."
     };
 }
+#pragma warning restore CS8321
 
 static string FormatAssistantValue(object? value)
 {
@@ -5784,6 +6179,14 @@ sealed record AssistantResponse(
     string Sql,
     string[] Columns,
     string[][] Rows
+);
+
+sealed record AiSqlPlan(
+    bool NeedsClarification,
+    string ClarificationQuestion,
+    string Sql,
+    string Explanation,
+    double Confidence
 );
 
 enum AssistantMetricKind

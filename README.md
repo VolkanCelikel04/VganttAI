@@ -51,10 +51,10 @@ Mikrofon -> konusma metne cevrilir -> /assistant/ask -> cevap ekrana yazilir -> 
 AI sorgu akisi:
 
 ```text
-Soru -> tenant metadata -> guvenli SELECT -> tenant PostgreSQL -> ozet + tablo
+Soru -> OpenAI GPT-5 mini -> AI SQL plani -> guvenlik kontrolu -> tenant PostgreSQL -> ozet + tablo
 ```
 
-`/assistant/ask` sadece SELECT uretir ve admin ekraninda tanimli tablo/view, kolon anlamlari ve iliskileri kullanir. Tarih veya tutar kolonu net degilse SQL calistirmadan once kullaniciya netlestirme sorusu doner.
+`/assistant/ask` sorguyu mutlaka AI modelinden gecirir. Model sadece admin ekraninda tanimli veya PostgreSQL semasindan okunan tablo/view, kolon anlamlari ve iliskileri kullanarak SELECT uretir. Join iliskilerini ve toplam, ortalama, maksimum, minimum, adet, count distinct, group by, order by gibi hesaplari AI olusturur. Backend AI'nin SQL'ini calistirmadan once sadece SELECT oldugunu ve bilinen objelere gittigini kontrol eder. Tarih veya tutar kolonu net degilse SQL calistirmadan once kullaniciya netlestirme sorusu doner.
 
 Telefon ayni yerel agdan bu bilgisayardaki API'ye baglanacaksa bilgisayarin IP adresini kullanin:
 
@@ -72,6 +72,9 @@ Backend PostgreSQL baglantisini ortam degiskeninden okur. Yerel server kurulumun
 VGANTT_REGISTRY_CONNECTION="Host=localhost;Port=5432;Database=vgantt_db;Username=vganttuser;Password=DB_PASSWORD;SSL Mode=Disable"
 VGANTT_API_BIND_HOST=0.0.0.0
 VGANTT_API_PORT=5055
+VGANTT_OPENAI_API_KEY=sk-CHANGE_ME
+VGANTT_AI_MODEL=gpt-5-mini
+VGANTT_TIME_ZONE=Europe/Istanbul
 VGANTT_TENANT_DB_PROVIDER=postgresql
 VGANTT_TENANT_DB_HOST=10.0.1.46
 VGANTT_TENANT_DB_PORT=5432
