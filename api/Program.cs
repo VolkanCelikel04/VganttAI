@@ -6,6 +6,7 @@ using System.Text;
 using System.Text.Json;
 using System.Text.RegularExpressions;
 using Npgsql;
+using Oracle.ManagedDataAccess.Client;
 
 LoadLocalEnvFile();
 
@@ -288,7 +289,7 @@ static async Task<HttpResponseData> RouteAsync(HttpRequestData request)
             return HttpResponseData.Json(HttpStatusCode.BadRequest, new { message = "Question is required." });
         }
 
-        return HttpResponseData.Json(HttpStatusCode.OK, await AnswerAssistantQuestionAsync(session, assistant.Question));
+        return HttpResponseData.Json(HttpStatusCode.OK, await AnswerAssistantQuestionAsync(session, assistant.Question, assistant.History ?? []));
     }
 
     if (request.Method == "GET" && request.Path == "/tenant/db/health")
@@ -401,6 +402,17 @@ static async Task<HttpResponseData> RouteAdminApiAsync(HttpRequestData request)
         }
 
         return HttpResponseData.Json(HttpStatusCode.OK, await SaveAdminViewColumnsAsync(session, columns));
+    }
+
+    if (request.Method == "POST" && request.Path == "/admin/api/view-columns/normalize")
+    {
+        var normalizeRequest = request.ReadJson<NormalizeAdminViewColumnsRequest>();
+        if (normalizeRequest is null || normalizeRequest.ViewId == Guid.Empty)
+        {
+            return HttpResponseData.Json(HttpStatusCode.BadRequest, new { message = "view_id is required." });
+        }
+
+        return HttpResponseData.Json(HttpStatusCode.OK, await NormalizeAdminViewColumnsAsync(session, normalizeRequest));
     }
 
     if (request.Method == "GET" && request.Path == "/admin/api/relations")
@@ -674,10 +686,18 @@ static string BuildAdminAppPage(AuthenticatedUser session, string activePage)
     var displayName = WebUtility.HtmlEncode(session.DisplayName);
     var role = WebUtility.HtmlEncode(session.Role);
     var activePageJson = JsonSerializer.Serialize(activePage, AppJson.Options);
-    var dashboardActive = activePage == "dashboard" ? "active" : "";
     var viewsActive = activePage == "views" ? "active" : "";
     var columnsActive = activePage == "columns" ? "active" : "";
     var relationsActive = activePage == "relations" ? "active" : "";
+    var pageTitle = activePage == "columns" ? "View Columns" : "Views";
+    var pageSubtitle = activePage == "columns"
+        ? "Excel veya metin yapistirarak kolonlari hizli yonetin."
+        : "View ekleme, display name guncelleme ve aktif/pasif yonetimi.";
+    if (activePage == "relations")
+    {
+        pageTitle = "View Relations";
+        pageSubtitle = "Relation sec, duzenle ve kaydet.";
+    }
 
     return $$"""
 <!doctype html>
@@ -768,7 +788,6 @@ static string BuildAdminAppPage(AuthenticatedUser session, string activePage)
       </div>
       <nav class="nav-section">
         <p class="nav-title">Admin</p>
-        <a class="nav-item {{dashboardActive}}" href="/admin/dashboard">Dashboard</a>
         <a class="nav-item {{viewsActive}}" href="/admin/settings/views">Views</a>
         <a class="nav-item {{columnsActive}}" href="/admin/settings/columns">View Columns</a>
         <a class="nav-item {{relationsActive}}" href="/admin/settings/relations">View Relations</a>
@@ -777,8 +796,8 @@ static string BuildAdminAppPage(AuthenticatedUser session, string activePage)
     <div class="content">
       <header class="topbar">
         <div>
-          <h1 id="pageTitle">Vgantt AI Admin</h1>
-          <p id="pageSubtitle">ERP view yapisini tanimlayin.</p>
+          <h1 id="pageTitle">{{pageTitle}}</h1>
+          <p id="pageSubtitle">{{pageSubtitle}}</p>
         </div>
         <div class="user-meta">
           <span>{{displayName}} / {{role}}</span>
@@ -786,15 +805,6 @@ static string BuildAdminAppPage(AuthenticatedUser session, string activePage)
         </div>
       </header>
       <main>
-        <section id="dashboardPage" class="section hidden">
-          <h2>Dashboard</h2>
-          <div class="stats">
-            <div class="stat"><strong id="viewCount">0</strong><span>View</span></div>
-            <div class="stat"><strong id="columnCount">0</strong><span>Kolon</span></div>
-            <div class="stat"><strong id="relationCount">0</strong><span>Iliski</span></div>
-          </div>
-        </section>
-
         <section id="viewsPage" class="grid-2 hidden">
           <div class="section">
             <h2>View Tanimi</h2>
@@ -818,39 +828,51 @@ static string BuildAdminAppPage(AuthenticatedUser session, string activePage)
             </div>
             <div class="table-wrap">
               <table>
-                <thead><tr><th>view_id</th><th>view_name</th><th>display_name_tr</th><th>is_active</th></tr></thead>
+                <thead><tr><th>view_id</th><th>view_name</th><th>display_name_tr</th><th>is_active</th><th>islem</th></tr></thead>
                 <tbody id="viewsBody"></tbody>
               </table>
             </div>
           </div>
         </section>
-
-        <section id="columnsPage" class="section hidden">
-          <div class="toolbar">
-            <div>
-              <h2>View Columns</h2>
-              <p>Her view icin AI'nin anlayacagi kolon sozlugunu yazin.</p>
+        <section id="columnsPage" class="grid-2 hidden">
+          <div class="section">
+            <h2>Kolon Tanimi</h2>
+            <form id="columnForm">
+              <label>View<select id="columnsViewSelect"></select></label>
+              <label>column_name<input id="columnNameInput" placeholder="order_no" required></label>
+              <label>display_name_tr<input id="columnDisplayNameInput" placeholder="Siparis No"></label>
+              <label>data_type<input id="columnDataTypeInput" placeholder="text"></label>
+              <label>semantic_meaning_tr<textarea id="columnSemanticInput" placeholder="Kolon anlami"></textarea></label>
+              <div class="check-row">
+                <label><input id="columnFilterableInput" type="checkbox" checked> is_filterable</label>
+                <label><input id="columnGroupableInput" type="checkbox" checked> is_groupable</label>
+                <label><input id="columnSummableInput" type="checkbox"> is_summable</label>
+                <label><input id="columnActiveInput" type="checkbox" checked> is_active</label>
+              </div>
+              <div class="button-row">
+                <button class="primary" type="submit">Kaydet</button>
+                <button id="newColumnButton" class="secondary" type="button">Yeni</button>
+              </div>
+              <div id="columnsMessage" class="message" role="status"></div>
+            </form>
+          </div>
+          <div class="section">
+            <div class="toolbar">
+              <h2>Columns</h2>
+              <button id="refreshColumnsButton" class="secondary" type="button">Yenile</button>
             </div>
-            <label>View<select id="columnsViewSelect"></select></label>
+            <div class="table-wrap">
+              <table>
+                <thead>
+                  <tr>
+                    <th>column_name</th><th>display_name_tr</th><th>data_type</th><th>active</th><th>islem</th>
+                  </tr>
+                </thead>
+                <tbody id="columnsBody"></tbody>
+              </table>
+            </div>
           </div>
-          <div class="button-row">
-            <button id="addColumnButton" class="secondary" type="button">Kolon ekle</button>
-            <button id="saveColumnsButton" class="primary" type="button">Kaydet</button>
-          </div>
-          <div class="table-wrap" style="margin-top:12px">
-            <table>
-              <thead>
-                <tr>
-                  <th>column_name</th><th>display_name_tr</th><th>data_type</th><th>semantic_meaning_tr</th>
-                  <th>filter</th><th>group</th><th>sum</th><th>active</th><th></th>
-                </tr>
-              </thead>
-              <tbody id="columnsBody"></tbody>
-            </table>
-          </div>
-          <div id="columnsMessage" class="message" role="status"></div>
         </section>
-
         <section id="relationsPage" class="grid-2 hidden">
           <div class="section">
             <h2>Relation Tanimi</h2>
@@ -867,12 +889,12 @@ static string BuildAdminAppPage(AuthenticatedUser session, string activePage)
                   <option>FULL JOIN</option>
                 </select>
               </label>
-              <label>description_tr<textarea id="relationDescriptionTr" placeholder="Siparis basligi ile siparis satirlari order_no uzerinden eslesir."></textarea></label>
+              <label>description_tr<textarea id="relationDescriptionTr" placeholder="Relation aciklamasi"></textarea></label>
               <div class="check-row"><label><input id="relationIsActive" type="checkbox" checked> is_active</label></div>
               <h2>Relation Columns</h2>
               <div id="relationColumns" class="relation-columns"></div>
               <div class="button-row">
-                <button id="addRelationColumnButton" class="secondary" type="button">Eslesme ekle</button>
+                <button id="addRelationColumnButton" class="secondary" type="button">Eslesme Ekle</button>
                 <button class="primary" type="submit">Kaydet</button>
                 <button id="newRelationButton" class="secondary" type="button">Yeni</button>
               </div>
@@ -881,12 +903,12 @@ static string BuildAdminAppPage(AuthenticatedUser session, string activePage)
           </div>
           <div class="section">
             <div class="toolbar">
-              <h2>View Relations</h2>
+              <h2>Relations</h2>
               <button id="refreshRelationsButton" class="secondary" type="button">Yenile</button>
             </div>
             <div class="table-wrap">
               <table>
-                <thead><tr><th>relation_name</th><th>source</th><th>target</th><th>join</th><th>columns</th><th>active</th></tr></thead>
+                <thead><tr><th>relation_name</th><th>source</th><th>target</th><th>join</th><th>active</th></tr></thead>
                 <tbody id="relationsBody"></tbody>
               </table>
             </div>
@@ -899,13 +921,8 @@ static string BuildAdminAppPage(AuthenticatedUser session, string activePage)
   <script>
     const activePage = {{activePageJson}};
     const token = localStorage.getItem('vgantt_admin_token');
-    const pageTitles = {
-      dashboard: ['Dashboard', 'Admin panel ozeti.'],
-      views: ['Views', 'ERP view tanimlarini yonetin.'],
-      columns: ['View Columns', 'Kolon anlamlarini ve AI semantigini yonetin.'],
-      relations: ['View Relations', 'View join/eslesme tanimlarini yonetin.']
-    };
     let views = [];
+    let columns = [];
     let relations = [];
 
     if (!token) {
@@ -944,26 +961,12 @@ static string BuildAdminAppPage(AuthenticatedUser session, string activePage)
       return response.json();
     }
 
-    function showPage(page) {
-      for (const id of ['dashboardPage', 'viewsPage', 'columnsPage', 'relationsPage']) {
-        document.getElementById(id).classList.add('hidden');
-      }
-      document.getElementById(`${page}Page`).classList.remove('hidden');
-      document.getElementById('pageTitle').textContent = pageTitles[page][0];
-      document.getElementById('pageSubtitle').textContent = pageTitles[page][1];
-    }
-
     function value(id) {
       return document.getElementById(id).value.trim();
     }
 
     function checked(id) {
       return document.getElementById(id).checked;
-    }
-
-    function optionText(id) {
-      const select = document.getElementById(id);
-      return select.options[select.selectedIndex]?.textContent || '';
     }
 
     function escapeHtml(value) {
@@ -978,17 +981,20 @@ static string BuildAdminAppPage(AuthenticatedUser session, string activePage)
       return String(value || '').slice(0, 8);
     }
 
-    async function loadDashboard() {
-      const dashboard = await api('/admin/api/dashboard');
-      document.getElementById('viewCount').textContent = dashboard.viewCount;
-      document.getElementById('columnCount').textContent = dashboard.columnCount;
-      document.getElementById('relationCount').textContent = dashboard.relationCount;
+    function showPage(page) {
+      for (const id of ['viewsPage', 'columnsPage', 'relationsPage']) {
+        const section = document.getElementById(id);
+        if (section) section.classList.add('hidden');
+      }
+      const currentSection = document.getElementById(`${page}Page`);
+      if (currentSection) currentSection.classList.remove('hidden');
     }
 
     async function loadViews() {
       views = await api('/admin/api/views');
       renderViews();
-      fillViewSelects();
+      fillColumnsViewSelect();
+      fillRelationViewSelects();
     }
 
     function renderViews() {
@@ -998,11 +1004,22 @@ static string BuildAdminAppPage(AuthenticatedUser session, string activePage)
           <td class="mono">${escapeHtml(view.viewName)}</td>
           <td>${escapeHtml(view.displayNameTr)}</td>
           <td>${view.isActive ? 'true' : 'false'}</td>
+          <td><button class="secondary" type="button" data-toggle-id="${view.viewId}">${view.isActive ? 'Pasif Yap' : 'Aktif Yap'}</button></td>
         </tr>
       `).join('');
 
       for (const row of document.querySelectorAll('#viewsBody tr')) {
         row.addEventListener('click', () => editView(views.find(view => view.viewId === row.dataset.viewId)));
+      }
+
+      for (const button of document.querySelectorAll('[data-toggle-id]')) {
+        button.addEventListener('click', async event => {
+          event.stopPropagation();
+          const viewId = button.dataset.toggleId;
+          const current = views.find(view => view.viewId === viewId);
+          if (!current) return;
+          await upsertView({ ...current, isActive: !current.isActive });
+        });
       }
     }
 
@@ -1024,106 +1041,141 @@ static string BuildAdminAppPage(AuthenticatedUser session, string activePage)
       setMessage('viewMessage', '', '');
     }
 
+    async function upsertView(payload) {
+      setMessage('viewMessage', '', 'Kaydediliyor...');
+      const saved = await api('/admin/api/views', { method: 'POST', body: JSON.stringify(payload) });
+      setMessage('viewMessage', 'ok', `${saved.viewName} kaydedildi.`);
+      await loadViews();
+      editView(saved);
+      return saved;
+    }
+
     async function saveView(event) {
       event.preventDefault();
-      setMessage('viewMessage', '', 'Kaydediliyor...');
-      const payload = {
+      await upsertView({
         viewId: value('viewId') || null,
         viewName: value('viewName'),
         displayNameTr: value('viewDisplayNameTr'),
         descriptionTr: value('viewDescriptionTr'),
         isActive: checked('viewIsActive')
-      };
-      const saved = await api('/admin/api/views', { method: 'POST', body: JSON.stringify(payload) });
-      setMessage('viewMessage', 'ok', `${saved.viewName} kaydedildi.`);
-      await loadViews();
-      editView(saved);
+      });
     }
 
-    function fillViewSelects() {
+    function fillColumnsViewSelect() {
+      const select = document.getElementById('columnsViewSelect');
+      if (!select) return;
       const options = views.map(view => `<option value="${view.viewId}">${escapeHtml(view.viewName)}</option>`).join('');
-      for (const id of ['columnsViewSelect', 'sourceViewSelect', 'targetViewSelect']) {
-        const select = document.getElementById(id);
-        if (select) select.innerHTML = options;
+      const selected = select.value;
+      select.innerHTML = options;
+      if (selected && views.some(view => view.viewId === selected)) {
+        select.value = selected;
+      }
+    }
+
+    function renderColumns() {
+      const body = document.getElementById('columnsBody');
+      if (!body) return;
+      body.innerHTML = columns.map(column => `
+        <tr data-column-name="${escapeHtml(column.columnName)}">
+          <td class="mono">${escapeHtml(column.columnName)}</td>
+          <td>${escapeHtml(column.displayNameTr)}</td>
+          <td>${escapeHtml(column.dataType)}</td>
+          <td>${column.isActive ? 'true' : 'false'}</td>
+          <td><button class="secondary" type="button" data-column-toggle="${escapeHtml(column.columnName)}">${column.isActive ? 'Pasif Yap' : 'Aktif Yap'}</button></td>
+        </tr>
+      `).join('');
+
+      for (const row of document.querySelectorAll('#columnsBody tr')) {
+        row.addEventListener('click', () => editColumn(columns.find(column => column.columnName === row.dataset.columnName)));
+      }
+
+      for (const button of document.querySelectorAll('[data-column-toggle]')) {
+        button.addEventListener('click', async event => {
+          event.stopPropagation();
+          const columnName = button.dataset.columnToggle;
+          const current = columns.find(column => column.columnName === columnName);
+          if (!current) return;
+          await upsertColumn({ ...current, isActive: !current.isActive });
+        });
       }
     }
 
     async function loadColumnsForSelectedView() {
       const viewId = value('columnsViewSelect');
-      if (!viewId) return;
-      const columns = await api(`/admin/api/view-columns?viewId=${encodeURIComponent(viewId)}`);
-      renderColumns(columns);
+      if (!viewId) {
+        columns = [];
+        renderColumns();
+        return;
+      }
+      columns = await api(`/admin/api/view-columns?viewId=${encodeURIComponent(viewId)}`);
+      renderColumns();
     }
 
-    function renderColumns(columns) {
-      const body = document.getElementById('columnsBody');
-      body.innerHTML = '';
-      for (const column of columns) {
-        addColumnRow(column);
+    function fillRelationViewSelects() {
+      const options = views.map(view => `<option value="${view.viewId}">${escapeHtml(view.viewName)}</option>`).join('');
+      for (const id of ['sourceViewSelect', 'targetViewSelect']) {
+        const select = document.getElementById(id);
+        if (!select) continue;
+        const selected = select.value;
+        select.innerHTML = options;
+        if (selected && views.some(view => view.viewId === selected)) {
+          select.value = selected;
+        }
       }
     }
 
-    function addColumnRow(column = {}) {
-      const row = document.createElement('tr');
-      row.innerHTML = `
-        <td><input data-field="columnName" value="${escapeHtml(column.columnName || '')}" placeholder="order_no"></td>
-        <td><input data-field="displayNameTr" value="${escapeHtml(column.displayNameTr || '')}" placeholder="Siparis No"></td>
-        <td><input data-field="dataType" value="${escapeHtml(column.dataType || '')}" placeholder="text"></td>
-        <td><textarea data-field="semanticMeaningTr" placeholder="Musteri siparis numarasi">${escapeHtml(column.semanticMeaningTr || '')}</textarea></td>
-        <td><input data-field="isFilterable" type="checkbox" ${column.isFilterable ?? true ? 'checked' : ''}></td>
-        <td><input data-field="isGroupable" type="checkbox" ${column.isGroupable ?? true ? 'checked' : ''}></td>
-        <td><input data-field="isSummable" type="checkbox" ${column.isSummable ? 'checked' : ''}></td>
-        <td><input data-field="isActive" type="checkbox" ${column.isActive ?? true ? 'checked' : ''}></td>
-        <td><button class="icon" type="button">X</button></td>
-      `;
-      row.querySelector('button').addEventListener('click', () => row.remove());
-      document.getElementById('columnsBody').appendChild(row);
+    function editColumn(column) {
+      if (!column) return;
+      document.getElementById('columnNameInput').value = column.columnName || '';
+      document.getElementById('columnDisplayNameInput').value = column.displayNameTr || '';
+      document.getElementById('columnDataTypeInput').value = column.dataType || '';
+      document.getElementById('columnSemanticInput').value = column.semanticMeaningTr || '';
+      document.getElementById('columnFilterableInput').checked = !!column.isFilterable;
+      document.getElementById('columnGroupableInput').checked = !!column.isGroupable;
+      document.getElementById('columnSummableInput').checked = !!column.isSummable;
+      document.getElementById('columnActiveInput').checked = !!column.isActive;
     }
 
-    async function saveColumns() {
-      const viewId = value('columnsViewSelect');
-      const columns = [...document.querySelectorAll('#columnsBody tr')]
-        .map(row => ({
-          columnName: row.querySelector('[data-field="columnName"]').value.trim(),
-          displayNameTr: row.querySelector('[data-field="displayNameTr"]').value.trim(),
-          dataType: row.querySelector('[data-field="dataType"]').value.trim(),
-          semanticMeaningTr: row.querySelector('[data-field="semanticMeaningTr"]').value.trim(),
-          isFilterable: row.querySelector('[data-field="isFilterable"]').checked,
-          isGroupable: row.querySelector('[data-field="isGroupable"]').checked,
-          isSummable: row.querySelector('[data-field="isSummable"]').checked,
-          isActive: row.querySelector('[data-field="isActive"]').checked
-        }))
-        .filter(column => column.columnName);
+    function clearColumnForm() {
+      document.getElementById('columnNameInput').value = '';
+      document.getElementById('columnDisplayNameInput').value = '';
+      document.getElementById('columnDataTypeInput').value = '';
+      document.getElementById('columnSemanticInput').value = '';
+      document.getElementById('columnFilterableInput').checked = true;
+      document.getElementById('columnGroupableInput').checked = true;
+      document.getElementById('columnSummableInput').checked = false;
+      document.getElementById('columnActiveInput').checked = true;
+      setMessage('columnsMessage', '', '');
+    }
 
+    async function upsertColumn(payload) {
+      const viewId = value('columnsViewSelect');
+      if (!viewId) {
+        setMessage('columnsMessage', 'error', 'Once bir view secin.');
+        return;
+      }
       setMessage('columnsMessage', '', 'Kaydediliyor...');
       const saved = await api('/admin/api/view-columns', {
         method: 'POST',
-        body: JSON.stringify({ viewId, columns })
+        body: JSON.stringify({ viewId, columns: [payload] })
       });
       setMessage('columnsMessage', 'ok', `${saved.savedCount} kolon kaydedildi.`);
       await loadColumnsForSelectedView();
+      editColumn(payload);
     }
 
-    async function loadRelations() {
-      relations = await api('/admin/api/relations');
-      renderRelations();
-    }
-
-    function renderRelations() {
-      document.getElementById('relationsBody').innerHTML = relations.map(relation => `
-        <tr data-relation-id="${relation.relationId}">
-          <td>${escapeHtml(relation.relationName)}</td>
-          <td class="mono">${escapeHtml(relation.sourceViewName)}</td>
-          <td class="mono">${escapeHtml(relation.targetViewName)}</td>
-          <td>${escapeHtml(relation.joinType)}</td>
-          <td>${relation.columns.length}</td>
-          <td>${relation.isActive ? 'true' : 'false'}</td>
-        </tr>
-      `).join('');
-
-      for (const row of document.querySelectorAll('#relationsBody tr')) {
-        row.addEventListener('click', () => editRelation(relations.find(relation => relation.relationId === row.dataset.relationId)));
-      }
+    async function saveColumn(event) {
+      event.preventDefault();
+      await upsertColumn({
+        columnName: value('columnNameInput'),
+        displayNameTr: value('columnDisplayNameInput'),
+        dataType: value('columnDataTypeInput'),
+        semanticMeaningTr: value('columnSemanticInput'),
+        isFilterable: checked('columnFilterableInput'),
+        isGroupable: checked('columnGroupableInput'),
+        isSummable: checked('columnSummableInput'),
+        isActive: checked('columnActiveInput')
+      });
     }
 
     function addRelationColumnRow(column = {}) {
@@ -1149,7 +1201,7 @@ static string BuildAdminAppPage(AuthenticatedUser session, string activePage)
       document.getElementById('relationDescriptionTr').value = '';
       document.getElementById('relationIsActive').checked = true;
       document.getElementById('relationColumns').innerHTML = '';
-      addRelationColumnRow({ sourceColumnName: 'order_no', targetColumnName: 'order_no', ordinal: 1 });
+      addRelationColumnRow({ sourceColumnName: 'id', targetColumnName: 'id', ordinal: 1 });
       setMessage('relationMessage', '', '');
     }
 
@@ -1166,15 +1218,33 @@ static string BuildAdminAppPage(AuthenticatedUser session, string activePage)
       for (const column of relation.columns) addRelationColumnRow(column);
     }
 
+    async function loadRelations() {
+      relations = await api('/admin/api/relations');
+      document.getElementById('relationsBody').innerHTML = relations.map(relation => `
+        <tr data-relation-id="${relation.relationId}">
+          <td>${escapeHtml(relation.relationName)}</td>
+          <td class="mono">${escapeHtml(relation.sourceViewName)}</td>
+          <td class="mono">${escapeHtml(relation.targetViewName)}</td>
+          <td>${escapeHtml(relation.joinType)}</td>
+          <td>${relation.isActive ? 'true' : 'false'}</td>
+        </tr>
+      `).join('');
+
+      for (const row of document.querySelectorAll('#relationsBody tr')) {
+        row.addEventListener('click', () => editRelation(relations.find(relation => relation.relationId === row.dataset.relationId)));
+      }
+    }
+
     async function saveRelation(event) {
       event.preventDefault();
-      const columns = [...document.querySelectorAll('.relation-column-row')]
+      const columnsPayload = [...document.querySelectorAll('.relation-column-row')]
         .map(row => ({
           ordinal: Number(row.querySelector('[data-field="ordinal"]').value || 1),
           sourceColumnName: row.querySelector('[data-field="sourceColumnName"]').value.trim(),
           targetColumnName: row.querySelector('[data-field="targetColumnName"]').value.trim()
         }))
         .filter(column => column.sourceColumnName && column.targetColumnName);
+
       setMessage('relationMessage', '', 'Kaydediliyor...');
       const saved = await api('/admin/api/relations', {
         method: 'POST',
@@ -1186,7 +1256,7 @@ static string BuildAdminAppPage(AuthenticatedUser session, string activePage)
           joinType: value('joinType'),
           descriptionTr: value('relationDescriptionTr'),
           isActive: checked('relationIsActive'),
-          columns
+          columns: columnsPayload
         })
       });
       setMessage('relationMessage', 'ok', `${saved.relationName} kaydedildi.`);
@@ -1201,19 +1271,21 @@ static string BuildAdminAppPage(AuthenticatedUser session, string activePage)
     document.getElementById('viewForm').addEventListener('submit', saveView);
     document.getElementById('newViewButton').addEventListener('click', clearViewForm);
     document.getElementById('refreshViewsButton').addEventListener('click', loadViews);
-    document.getElementById('columnsViewSelect').addEventListener('change', loadColumnsForSelectedView);
-    document.getElementById('addColumnButton').addEventListener('click', () => addColumnRow());
-    document.getElementById('saveColumnsButton').addEventListener('click', saveColumns);
-    document.getElementById('relationForm').addEventListener('submit', saveRelation);
-    document.getElementById('newRelationButton').addEventListener('click', clearRelationForm);
-    document.getElementById('addRelationColumnButton').addEventListener('click', () => addRelationColumnRow());
-    document.getElementById('refreshRelationsButton').addEventListener('click', loadRelations);
+    document.getElementById('columnsViewSelect')?.addEventListener('change', loadColumnsForSelectedView);
+    document.getElementById('columnForm')?.addEventListener('submit', saveColumn);
+    document.getElementById('newColumnButton')?.addEventListener('click', clearColumnForm);
+    document.getElementById('refreshColumnsButton')?.addEventListener('click', loadColumnsForSelectedView);
+    document.getElementById('relationForm')?.addEventListener('submit', saveRelation);
+    document.getElementById('newRelationButton')?.addEventListener('click', clearRelationForm);
+    document.getElementById('addRelationColumnButton')?.addEventListener('click', () => addRelationColumnRow());
+    document.getElementById('refreshRelationsButton')?.addEventListener('click', loadRelations);
 
     async function boot() {
       showPage(activePage);
       await loadViews();
-      if (activePage === 'dashboard') await loadDashboard();
-      if (activePage === 'columns') await loadColumnsForSelectedView();
+      if (activePage === 'columns') {
+        await loadColumnsForSelectedView();
+      }
       if (activePage === 'relations') {
         clearRelationForm();
         await loadRelations();
@@ -3344,6 +3416,221 @@ static async Task<SaveAdminViewColumnsResponse> SaveAdminViewColumnsAsync(
     return new SaveAdminViewColumnsResponse(request.ViewId, savedCount);
 }
 
+static async Task<NormalizeAdminViewColumnsResponse> NormalizeAdminViewColumnsAsync(
+    AuthenticatedUser session,
+    NormalizeAdminViewColumnsRequest request
+)
+{
+    await ValidateTenantViewOwnershipAsync(session.TenantId, request.ViewId);
+
+    var draftColumns = request.Columns ?? [];
+    if (draftColumns.Length == 0 && !string.IsNullOrWhiteSpace(request.RawInput))
+    {
+        draftColumns = ParseBulkColumnsFromRawText(request.RawInput);
+    }
+
+    var normalized = draftColumns
+        .Where(column => !string.IsNullOrWhiteSpace(column.ColumnName))
+        .Select(NormalizeAdminViewColumnInput)
+        .GroupBy(column => column.ColumnName, StringComparer.OrdinalIgnoreCase)
+        .Select(group => group.Last())
+        .ToArray();
+
+    if (normalized.Length == 0)
+    {
+        return new NormalizeAdminViewColumnsResponse(
+            Message: "Islenecek kolon bulunamadi.",
+            Columns: []
+        );
+    }
+
+    var aiKey = Environment.GetEnvironmentVariable("VGANTT_OPENAI_API_KEY");
+    if (string.IsNullOrWhiteSpace(aiKey))
+    {
+        return new NormalizeAdminViewColumnsResponse(
+            Message: "AI anahtari yok; kolonlar kurallara gore sadeleştirildi.",
+            Columns: normalized
+        );
+    }
+
+    try
+    {
+        var aiColumns = await NormalizeColumnsWithOpenAiAsync(normalized, aiKey);
+        var merged = aiColumns
+            .Where(column => !string.IsNullOrWhiteSpace(column.ColumnName))
+            .Select(NormalizeAdminViewColumnInput)
+            .GroupBy(column => column.ColumnName, StringComparer.OrdinalIgnoreCase)
+            .Select(group => group.Last())
+            .ToArray();
+
+        return new NormalizeAdminViewColumnsResponse(
+            Message: "Kolonlar AI ile duzeltildi.",
+            Columns: merged.Length == 0 ? normalized : merged
+        );
+    }
+    catch
+    {
+        return new NormalizeAdminViewColumnsResponse(
+            Message: "AI su an kullanilamadi; kurala dayali duzeltme uygulandi.",
+            Columns: normalized
+        );
+    }
+}
+
+static async Task ValidateTenantViewOwnershipAsync(Guid tenantId, Guid viewId)
+{
+    await using var connection = await OpenRegistryConnectionAsync();
+    await using var command = new NpgsqlCommand("""
+        select 1
+        from tenant_erp_objects
+        where id = @view_id
+          and tenant_id = @tenant_id
+        limit 1
+        """, connection);
+
+    command.Parameters.AddWithValue("tenant_id", tenantId);
+    command.Parameters.AddWithValue("view_id", viewId);
+
+    var exists = await command.ExecuteScalarAsync();
+    if (exists is null)
+    {
+        throw new InvalidOperationException("Secilen view bulunamadi.");
+    }
+}
+
+static AdminViewColumnInput[] ParseBulkColumnsFromRawText(string rawInput)
+{
+    var rows = rawInput
+        .Split(['\r', '\n'], StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+        .Select(row => row.Trim())
+        .Where(row => row.Length > 0);
+
+    var columns = new List<AdminViewColumnInput>();
+    foreach (var row in rows)
+    {
+        var parts = row.Split(['\t', ';', '|'], StringSplitOptions.TrimEntries);
+        if (parts.Length == 0 || string.IsNullOrWhiteSpace(parts[0]))
+        {
+            continue;
+        }
+
+        columns.Add(new AdminViewColumnInput(
+            ColumnName: parts[0],
+            DisplayNameTr: parts.Length > 1 ? parts[1] : null,
+            DataType: parts.Length > 2 ? parts[2] : null,
+            SemanticMeaningTr: parts.Length > 3 ? parts[3] : null,
+            IsFilterable: true,
+            IsGroupable: true,
+            IsSummable: Regex.IsMatch(parts[0], "(amount|total|qty|quantity|tutar|adet|miktar)", RegexOptions.IgnoreCase),
+            IsActive: true
+        ));
+    }
+
+    return columns.ToArray();
+}
+
+static AdminViewColumnInput NormalizeAdminViewColumnInput(AdminViewColumnInput column)
+{
+    var normalizedName = Regex.Replace(column.ColumnName.Trim().ToLowerInvariant(), @"[^a-z0-9_]", "_");
+    normalizedName = Regex.Replace(normalizedName, @"_+", "_").Trim('_');
+    if (string.IsNullOrWhiteSpace(normalizedName))
+    {
+        normalizedName = "column";
+    }
+
+    var displayName = string.IsNullOrWhiteSpace(column.DisplayNameTr)
+        ? normalizedName.Replace('_', ' ')
+        : column.DisplayNameTr.Trim();
+    var semantic = string.IsNullOrWhiteSpace(column.SemanticMeaningTr)
+        ? displayName
+        : column.SemanticMeaningTr.Trim();
+    var dataType = string.IsNullOrWhiteSpace(column.DataType) ? "text" : column.DataType.Trim().ToLowerInvariant();
+    var isSummable = column.IsSummable || Regex.IsMatch(normalizedName, "(amount|total|qty|quantity|tutar|adet|miktar)", RegexOptions.IgnoreCase);
+
+    return column with
+    {
+        ColumnName = normalizedName,
+        DisplayNameTr = displayName,
+        DataType = dataType,
+        SemanticMeaningTr = semantic,
+        IsSummable = isSummable
+    };
+}
+
+static async Task<AdminViewColumnInput[]> NormalizeColumnsWithOpenAiAsync(AdminViewColumnInput[] columns, string apiKey)
+{
+    var model = Environment.GetEnvironmentVariable("VGANTT_AI_MODEL") ?? "gpt-5-mini";
+    var endpoint = Environment.GetEnvironmentVariable("VGANTT_OPENAI_RESPONSES_URL") ?? "https://api.openai.com/v1/responses";
+    var requestBody = new Dictionary<string, object?>
+    {
+        ["model"] = model,
+        ["instructions"] = "Normalize ERP column definitions. Return only JSON schema. Keep meaning in Turkish. Use lowercase snake_case for columnName.",
+        ["input"] = JsonSerializer.Serialize(columns, AppJson.Options),
+        ["max_output_tokens"] = 1400,
+        ["text"] = new Dictionary<string, object?>
+        {
+            ["format"] = new Dictionary<string, object?>
+            {
+                ["type"] = "json_schema",
+                ["name"] = "normalized_columns",
+                ["strict"] = true,
+                ["schema"] = new Dictionary<string, object?>
+                {
+                    ["type"] = "object",
+                    ["additionalProperties"] = false,
+                    ["required"] = new[] { "columns" },
+                    ["properties"] = new Dictionary<string, object?>
+                    {
+                        ["columns"] = new Dictionary<string, object?>
+                        {
+                            ["type"] = "array",
+                            ["items"] = new Dictionary<string, object?>
+                            {
+                                ["type"] = "object",
+                                ["additionalProperties"] = false,
+                                ["required"] = new[] { "columnName", "displayNameTr", "dataType", "semanticMeaningTr", "isFilterable", "isGroupable", "isSummable", "isActive" },
+                                ["properties"] = new Dictionary<string, object?>
+                                {
+                                    ["columnName"] = new Dictionary<string, object?> { ["type"] = "string" },
+                                    ["displayNameTr"] = new Dictionary<string, object?> { ["type"] = "string" },
+                                    ["dataType"] = new Dictionary<string, object?> { ["type"] = "string" },
+                                    ["semanticMeaningTr"] = new Dictionary<string, object?> { ["type"] = "string" },
+                                    ["isFilterable"] = new Dictionary<string, object?> { ["type"] = "boolean" },
+                                    ["isGroupable"] = new Dictionary<string, object?> { ["type"] = "boolean" },
+                                    ["isSummable"] = new Dictionary<string, object?> { ["type"] = "boolean" },
+                                    ["isActive"] = new Dictionary<string, object?> { ["type"] = "boolean" }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    };
+
+    using var httpClient = new HttpClient { Timeout = TimeSpan.FromSeconds(35) };
+    using var requestMessage = new HttpRequestMessage(HttpMethod.Post, endpoint);
+    requestMessage.Headers.Authorization = new System.Net.Http.Headers.AuthenticationHeaderValue("Bearer", apiKey);
+    requestMessage.Content = new StringContent(JsonSerializer.Serialize(requestBody, AppJson.Options), Encoding.UTF8, "application/json");
+
+    using var response = await httpClient.SendAsync(requestMessage);
+    var responseBody = await response.Content.ReadAsStringAsync();
+    if (!response.IsSuccessStatusCode)
+    {
+        throw new InvalidOperationException($"AI model error: {(int)response.StatusCode} {responseBody}");
+    }
+
+    using var document = JsonDocument.Parse(responseBody);
+    var outputText = ExtractOpenAiOutputText(document.RootElement);
+    if (string.IsNullOrWhiteSpace(outputText))
+    {
+        throw new InvalidOperationException("AI model did not return normalized columns.");
+    }
+
+    var parsed = JsonSerializer.Deserialize<NormalizedColumnsOutput>(outputText, AppJson.Options);
+    return parsed?.Columns ?? [];
+}
+
 static async Task<AdminRelationResponse[]> LoadAdminRelationsAsync(Guid tenantId)
 {
     var relations = new Dictionary<Guid, AdminRelationResponseBuilder>();
@@ -4109,7 +4396,11 @@ static string? ReadEnv(params string[] names)
     return null;
 }
 
-static async Task<AssistantResponse> AnswerAssistantQuestionAsync(AuthenticatedUser session, string question)
+static async Task<AssistantResponse> AnswerAssistantQuestionAsync(
+    AuthenticatedUser session,
+    string question,
+    AssistantHistoryItem[] history
+)
 {
     var schema = await LoadAssistantSchemaAsync(session.TenantId);
     if (schema.Objects.Length == 0)
@@ -4117,7 +4408,7 @@ static async Task<AssistantResponse> AnswerAssistantQuestionAsync(AuthenticatedU
         return AskForClarification("Once admin ekraninda sorgulanacak tablo/view ve kolon anlamlarini tanimlamaliyiz.");
     }
 
-    var aiPlan = await BuildOpenAiSqlPlanAsync(schema, question);
+    var aiPlan = await BuildOpenAiSqlPlanAsync(schema, question, history);
     if (aiPlan.NeedsClarification)
     {
         return AskForClarification(string.IsNullOrWhiteSpace(aiPlan.ClarificationQuestion)
@@ -4128,7 +4419,16 @@ static async Task<AssistantResponse> AnswerAssistantQuestionAsync(AuthenticatedU
     var sql = aiPlan.Sql.Trim();
     ValidateAiGeneratedSql(schema, sql);
 
-    if (!string.Equals(schema.Connection.Provider, "postgresql", StringComparison.OrdinalIgnoreCase))
+    AssistantQueryResult result;
+    if (string.Equals(schema.Connection.Provider, "postgresql", StringComparison.OrdinalIgnoreCase))
+    {
+        result = await ExecuteTenantPostgresQueryAsync(schema.Connection, sql);
+    }
+    else if (string.Equals(schema.Connection.Provider, "oracle", StringComparison.OrdinalIgnoreCase))
+    {
+        result = await ExecuteTenantOracleQueryAsync(schema.Connection, sql);
+    }
+    else
     {
         return new AssistantResponse(
             Summary: $"{schema.Connection.Provider} icin AI SQL olusturdu; bu provider icin sorgu calistirma surucusu henuz eklenmedi.",
@@ -4138,7 +4438,6 @@ static async Task<AssistantResponse> AnswerAssistantQuestionAsync(AuthenticatedU
         );
     }
 
-    var result = await ExecuteTenantPostgresQueryAsync(schema.Connection, sql);
     return new AssistantResponse(
         Summary: BuildAiSqlSummary(aiPlan, result),
         Sql: sql,
@@ -4157,7 +4456,11 @@ static AssistantResponse AskForClarification(string message)
     );
 }
 
-static async Task<AiSqlPlan> BuildOpenAiSqlPlanAsync(AssistantSchema schema, string question)
+static async Task<AiSqlPlan> BuildOpenAiSqlPlanAsync(
+    AssistantSchema schema,
+    string question,
+    AssistantHistoryItem[] history
+)
 {
     var apiKey = Environment.GetEnvironmentVariable("VGANTT_OPENAI_API_KEY");
     if (string.IsNullOrWhiteSpace(apiKey))
@@ -4177,7 +4480,7 @@ static async Task<AiSqlPlan> BuildOpenAiSqlPlanAsync(AssistantSchema schema, str
     {
         ["model"] = model,
         ["instructions"] = BuildAiSqlSystemPrompt(schema.Connection.Provider),
-        ["input"] = BuildAiSqlUserPrompt(schema, question),
+        ["input"] = BuildAiSqlUserPrompt(schema, question, history),
         ["max_output_tokens"] = 1600,
         ["text"] = new Dictionary<string, object?>
         {
@@ -4235,6 +4538,9 @@ static string BuildAiSqlSystemPrompt(string provider)
         - Do not use SELECT *.
         - Do not include semicolons or SQL comments.
         - If the question is ambiguous, set needsClarification=true and ask one short Turkish clarification question.
+        - Use the conversation context for follow-up questions. Turkish references such as "yukaridaki", "az onceki", "bu", "bunun", "ayni", "bu sefer", "ona gore" usually refer to the previous user question, previous SQL, selected tables, joins, filters, date range, or metric.
+        - For follow-up questions, preserve previous table choices, joins, filters, and date ranges unless the new question clearly changes them.
+        - If a follow-up cannot be resolved from the conversation context, ask a clarification question instead of guessing.
         - If a date is mentioned as today/bugun, use the provided current date.
         - If user asks "kac/adet/sayisi/count", use count(*) unless a distinct business metric is clearly required.
         - If user asks "toplam/tutar/ciro/ne kadar/sum", use SUM over the best numeric amount column.
@@ -4253,10 +4559,70 @@ static string BuildAiSqlSystemPrompt(string provider)
         """;
 }
 
-static string BuildAiSqlUserPrompt(AssistantSchema schema, string question)
+static string BuildConversationContextText(AssistantHistoryItem[] history)
+{
+    if (history.Length == 0)
+    {
+        return string.Empty;
+    }
+
+    var builder = new StringBuilder();
+    foreach (var item in history.TakeLast(12))
+    {
+        var role = string.IsNullOrWhiteSpace(item.Role) ? "unknown" : item.Role.Trim().ToLowerInvariant();
+        var text = TruncateForAiPrompt(item.Text, 900);
+        if (!string.IsNullOrWhiteSpace(text))
+        {
+            builder.AppendLine($"- {role}: {text}");
+        }
+
+        if (!string.IsNullOrWhiteSpace(item.Sql))
+        {
+            builder.AppendLine($"  sql: {TruncateForAiPrompt(item.Sql, 1200)}");
+        }
+
+        if (item.Columns is { Length: > 0 })
+        {
+            builder.AppendLine($"  columns: {string.Join(", ", item.Columns.Take(30))}");
+        }
+
+        if (item.Rows is { Length: > 0 })
+        {
+            var rowTexts = item.Rows
+                .Take(3)
+                .Select(row => $"[{string.Join(", ", row.Take(12).Select(value => TruncateForAiPrompt(value, 80)))}]");
+            builder.AppendLine($"  sample_rows: {string.Join("; ", rowTexts)}");
+        }
+    }
+
+    return builder.ToString().Trim();
+}
+
+static string TruncateForAiPrompt(string? value, int maxLength)
+{
+    if (string.IsNullOrWhiteSpace(value))
+    {
+        return string.Empty;
+    }
+
+    var normalized = Regex.Replace(value.Trim(), @"\s+", " ");
+    return normalized.Length <= maxLength
+        ? normalized
+        : normalized[..maxLength] + "...";
+}
+
+static string BuildAiSqlUserPrompt(
+    AssistantSchema schema,
+    string question,
+    AssistantHistoryItem[] history
+)
 {
     var today = GetConfiguredToday();
-    var selectedObjects = SelectObjectsForAiPrompt(schema, question).ToList();
+    var conversationText = BuildConversationContextText(history);
+    var searchQuestion = string.IsNullOrWhiteSpace(conversationText)
+        ? question
+        : $"{conversationText}\n{question}";
+    var selectedObjects = SelectObjectsForAiPrompt(schema, searchQuestion).ToList();
     var selectedObjectIds = selectedObjects.Select(queryObject => queryObject.ObjectId).ToHashSet();
     var connectedRelations = schema.Relations
         .Where(relation => selectedObjectIds.Contains(relation.SourceObjectId) || selectedObjectIds.Contains(relation.TargetObjectId))
@@ -4282,6 +4648,13 @@ static string BuildAiSqlUserPrompt(AssistantSchema schema, string question)
     var prompt = new StringBuilder();
     prompt.AppendLine($"Current date: {today:yyyy-MM-dd}");
     prompt.AppendLine($"Database provider: {schema.Connection.Provider}");
+    if (!string.IsNullOrWhiteSpace(conversationText))
+    {
+        prompt.AppendLine();
+        prompt.AppendLine("Conversation context:");
+        prompt.AppendLine(conversationText);
+    }
+
     prompt.AppendLine($"User question: {question}");
     prompt.AppendLine();
     prompt.AppendLine("Schema objects:");
@@ -4966,6 +5339,60 @@ static async Task<AssistantQueryResult> ExecuteTenantPostgresQueryAsync(TenantDb
     }
 
     return new AssistantQueryResult(columns, rows.ToArray());
+}
+
+static async Task<AssistantQueryResult> ExecuteTenantOracleQueryAsync(TenantDbConnectionSettings settings, string sql)
+{
+    if (!IsSafeSelectSql(sql))
+    {
+        throw new InvalidOperationException("Only SELECT queries can be executed by the assistant.");
+    }
+
+    await using var connection = new OracleConnection(BuildTenantOracleConnectionString(settings));
+    await connection.OpenAsync();
+    await using var command = connection.CreateCommand();
+    command.CommandText = sql;
+    command.CommandTimeout = 30;
+
+    await using var reader = await command.ExecuteReaderAsync();
+    var columns = Enumerable.Range(0, reader.FieldCount)
+        .Select(reader.GetName)
+        .ToArray();
+    var rows = new List<string[]>();
+
+    while (await reader.ReadAsync() && rows.Count < 100)
+    {
+        var row = new string[reader.FieldCount];
+        for (var index = 0; index < reader.FieldCount; index += 1)
+        {
+            row[index] = FormatAssistantValue(await reader.IsDBNullAsync(index) ? null : reader.GetValue(index));
+        }
+
+        rows.Add(row);
+    }
+
+    return new AssistantQueryResult(columns, rows.ToArray());
+}
+
+static string BuildTenantOracleConnectionString(TenantDbConnectionSettings settings)
+{
+    var dataSource = settings.DatabaseName.Trim();
+    if (!dataSource.StartsWith("(", StringComparison.Ordinal))
+    {
+        dataSource = dataSource.Contains(':', StringComparison.Ordinal) || dataSource.Contains('/', StringComparison.Ordinal)
+            ? dataSource
+            : $"(DESCRIPTION=(ADDRESS=(PROTOCOL=TCP)(HOST={settings.Host})(PORT={settings.Port}))(CONNECT_DATA=(SERVICE_NAME={dataSource})))";
+    }
+
+    var builder = new OracleConnectionStringBuilder
+    {
+        UserID = settings.Username,
+        Password = settings.Password,
+        DataSource = dataSource,
+        ConnectionTimeout = 5
+    };
+
+    return builder.ConnectionString;
 }
 
 static bool IsSafeSelectSql(string sql)
@@ -6172,7 +6599,18 @@ sealed record LoginRequest(
 
 sealed record LoginResponse(string Token, string TenantName, string UserDisplayName, string Role);
 
-sealed record AssistantRequest(string Question);
+sealed record AssistantRequest(
+    string Question,
+    AssistantHistoryItem[]? History = null
+);
+
+sealed record AssistantHistoryItem(
+    string Role,
+    string Text,
+    string? Sql = null,
+    string[]? Columns = null,
+    string[][]? Rows = null
+);
 
 sealed record AssistantResponse(
     string Summary,
@@ -6439,6 +6877,12 @@ sealed record SaveAdminViewColumnsRequest(
     AdminViewColumnInput[]? Columns
 );
 
+sealed record NormalizeAdminViewColumnsRequest(
+    Guid ViewId,
+    string? RawInput = null,
+    AdminViewColumnInput[]? Columns = null
+);
+
 sealed record AdminViewColumnInput(
     string ColumnName,
     string? DisplayNameTr = null,
@@ -6464,6 +6908,13 @@ sealed record AdminViewColumnResponse(
 );
 
 sealed record SaveAdminViewColumnsResponse(Guid ViewId, int SavedCount);
+
+sealed record NormalizeAdminViewColumnsResponse(
+    string Message,
+    AdminViewColumnInput[] Columns
+);
+
+sealed record NormalizedColumnsOutput(AdminViewColumnInput[] Columns);
 
 sealed record SaveAdminRelationRequest(
     Guid? RelationId,
