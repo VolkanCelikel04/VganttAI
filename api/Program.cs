@@ -5195,49 +5195,66 @@ static async Task<AiSqlPlan> BuildOpenAiSqlPlanAsync(
 
     var model = Environment.GetEnvironmentVariable("VGANTT_AI_MODEL") ?? "gpt-5-mini";
     var endpoint = Environment.GetEnvironmentVariable("VGANTT_OPENAI_RESPONSES_URL") ?? "https://api.openai.com/v1/responses";
-    var requestBody = new Dictionary<string, object?>
-    {
-        ["model"] = model,
-        ["instructions"] = BuildAiSqlSystemPrompt(schema.Connection.Provider),
-        ["input"] = BuildAiSqlUserPrompt(schema, question, history),
-        ["max_output_tokens"] = 1600,
-        ["text"] = new Dictionary<string, object?>
-        {
-            ["format"] = new Dictionary<string, object?>
-            {
-                ["type"] = "json_schema",
-                ["name"] = "vgantt_sql_plan",
-                ["strict"] = true,
-                ["schema"] = BuildAiSqlPlanJsonSchema()
-            }
-        }
-    };
-
     using var httpClient = new HttpClient
     {
         Timeout = TimeSpan.FromSeconds(35)
     };
-    using var request = new HttpRequestMessage(HttpMethod.Post, endpoint);
-    request.Headers.Authorization = new System.Net.Http.Headers.AuthenticationHeaderValue("Bearer", apiKey);
-    request.Content = new StringContent(JsonSerializer.Serialize(requestBody, AppJson.Options), Encoding.UTF8, "application/json");
 
-    using var response = await httpClient.SendAsync(request);
-    var responseBody = await response.Content.ReadAsStringAsync();
-    if (!response.IsSuccessStatusCode)
+    var input = BuildAiSqlUserPrompt(schema, question, history);
+    for (var attempt = 0; attempt < 2; attempt++)
     {
-        throw new InvalidOperationException($"AI model error: {(int)response.StatusCode} {responseBody}");
+        var requestBody = new Dictionary<string, object?>
+        {
+            ["model"] = model,
+            ["instructions"] = BuildAiSqlSystemPrompt(schema.Connection.Provider),
+            ["input"] = input,
+            ["max_output_tokens"] = 3000,
+            ["text"] = new Dictionary<string, object?>
+            {
+                ["format"] = new Dictionary<string, object?>
+                {
+                    ["type"] = "json_schema",
+                    ["name"] = "vgantt_sql_plan",
+                    ["strict"] = true,
+                    ["schema"] = BuildAiSqlPlanJsonSchema()
+                }
+            }
+        };
+
+        using var request = new HttpRequestMessage(HttpMethod.Post, endpoint);
+        request.Headers.Authorization = new System.Net.Http.Headers.AuthenticationHeaderValue("Bearer", apiKey);
+        request.Content = new StringContent(JsonSerializer.Serialize(requestBody, AppJson.Options), Encoding.UTF8, "application/json");
+
+        using var response = await httpClient.SendAsync(request);
+        var responseBody = await response.Content.ReadAsStringAsync();
+        if (!response.IsSuccessStatusCode)
+        {
+            throw new InvalidOperationException($"AI model error: {(int)response.StatusCode} {responseBody}");
+        }
+
+        using var document = JsonDocument.Parse(responseBody);
+        var outputText = ExtractOpenAiOutputText(document.RootElement);
+        if (string.IsNullOrWhiteSpace(outputText))
+        {
+            throw new InvalidOperationException("AI model did not return SQL plan text.");
+        }
+
+        try
+        {
+            return JsonSerializer.Deserialize<AiSqlPlan>(outputText, AppJson.Options)
+                ?? throw new InvalidOperationException("AI SQL plan could not be parsed.");
+        }
+        catch (JsonException) when (attempt == 0)
+        {
+            input = BuildAiSqlRepairPrompt(schema, question, history, outputText);
+        }
+        catch (JsonException error)
+        {
+            throw new InvalidOperationException("AI SQL plani gecersiz JSON olarak geldi. Lutfen soruyu tekrar deneyin.", error);
+        }
     }
 
-    using var document = JsonDocument.Parse(responseBody);
-    var outputText = ExtractOpenAiOutputText(document.RootElement);
-    if (string.IsNullOrWhiteSpace(outputText))
-    {
-        throw new InvalidOperationException("AI model did not return SQL plan text.");
-    }
-
-    var plan = JsonSerializer.Deserialize<AiSqlPlan>(outputText, AppJson.Options)
-        ?? throw new InvalidOperationException("AI SQL plan could not be parsed.");
-    return plan;
+    throw new InvalidOperationException("AI SQL plan could not be parsed.");
 }
 
 static string BuildAiSqlSystemPrompt(string provider)
@@ -5440,6 +5457,28 @@ static string BuildAiSqlUserPrompt(
         }
     }
 
+    return prompt.ToString();
+}
+
+static string BuildAiSqlRepairPrompt(
+    AssistantSchema schema,
+    string question,
+    AssistantHistoryItem[] history,
+    string invalidOutput
+)
+{
+    var prompt = new StringBuilder();
+    prompt.AppendLine(BuildAiSqlUserPrompt(schema, question, history));
+    prompt.AppendLine();
+    prompt.AppendLine("Previous response was invalid JSON and could not be parsed by System.Text.Json.");
+    prompt.AppendLine("Return the same plan again as strictly valid JSON matching the schema.");
+    prompt.AppendLine("Important JSON rules:");
+    prompt.AppendLine("- Escape double quotes inside sql strings, for example o.\\\"ORDER_NO\\\".");
+    prompt.AppendLine("- Do not put raw line breaks inside JSON strings; use \\n escapes or a single-line SQL string.");
+    prompt.AppendLine("- Return only the JSON object, with no markdown fences or extra text.");
+    prompt.AppendLine();
+    prompt.AppendLine("Invalid response excerpt:");
+    prompt.AppendLine(TruncateForAiPrompt(invalidOutput, 1800));
     return prompt.ToString();
 }
 
