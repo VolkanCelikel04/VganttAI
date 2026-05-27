@@ -34,6 +34,7 @@ class ApiClient {
   Future<AssistantAnswer> ask({
     required String token,
     required String question,
+    List<AssistantHistoryEntry> history = const [],
   }) async {
     if (AppConfig.useMockBackend) {
       await Future<void>.delayed(const Duration(milliseconds: 700));
@@ -60,6 +61,7 @@ limit 10''',
 
     final response = await _post('/assistant/ask', {
       'question': question,
+      'history': [for (final item in history) item.toJson()],
     }, token: token);
 
     return AssistantAnswer.fromJson(response);
@@ -125,6 +127,32 @@ class LoginResult {
   final String token;
   final String tenantName;
   final String userDisplayName;
+}
+
+class AssistantHistoryEntry {
+  const AssistantHistoryEntry({
+    required this.role,
+    required this.text,
+    this.sql,
+    this.columns = const [],
+    this.rows = const [],
+  });
+
+  final String role;
+  final String text;
+  final String? sql;
+  final List<String> columns;
+  final List<List<String>> rows;
+
+  Map<String, dynamic> toJson() {
+    return {
+      'role': role,
+      'text': text,
+      if (sql != null && sql!.trim().isNotEmpty) 'sql': sql,
+      if (columns.isNotEmpty) 'columns': columns,
+      if (rows.isNotEmpty) 'rows': rows,
+    };
+  }
 }
 
 class AssistantAnswer {

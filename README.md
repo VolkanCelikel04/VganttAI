@@ -54,7 +54,7 @@ AI sorgu akisi:
 Soru -> OpenAI GPT-5 mini -> AI SQL plani -> guvenlik kontrolu -> tenant PostgreSQL -> ozet + tablo
 ```
 
-`/assistant/ask` sorguyu mutlaka AI modelinden gecirir. Model sadece admin ekraninda tanimli veya PostgreSQL semasindan okunan tablo/view, kolon anlamlari ve iliskileri kullanarak SELECT uretir. Join iliskilerini ve toplam, ortalama, maksimum, minimum, adet, count distinct, group by, order by gibi hesaplari AI olusturur. Backend AI'nin SQL'ini calistirmadan once sadece SELECT oldugunu ve bilinen objelere gittigini kontrol eder. Tarih veya tutar kolonu net degilse SQL calistirmadan once kullaniciya netlestirme sorusu doner.
+`/assistant/ask` sorguyu mutlaka AI modelinden gecirir. Model sadece admin ekraninda tanimli veya PostgreSQL semasindan okunan tablo/view, kolon anlamlari ve iliskileri kullanarak SELECT uretir. Join iliskilerini ve toplam, ortalama, maksimum, minimum, adet, count distinct, group by, order by gibi hesaplari AI olusturur. Mobil uygulama son konusma gecmisini de gonderir; "yukaridaki", "aynisi", "bu sefer toplam" gibi takip sorulari onceki SQL ve cevap baglamiyla cozulur. Backend AI'nin SQL'ini calistirmadan once sadece SELECT oldugunu ve bilinen objelere gittigini kontrol eder. Tarih veya tutar kolonu net degilse SQL calistirmadan once kullaniciya netlestirme sorusu doner.
 
 Telefon ayni yerel agdan bu bilgisayardaki API'ye baglanacaksa bilgisayarin IP adresini kullanin:
 

@@ -233,6 +233,7 @@ class _AssistantScreenState extends State<AssistantScreen> {
           'Merhaba. ERP veriniz icin sadece okuma amacli sorular sorabilirsiniz.',
     ),
   ].toList();
+  final List<AssistantHistoryEntry> _conversationHistory = [];
   AssistantAnswer? _latestAnswer;
   var _isLoading = false;
   var _speechReady = false;
@@ -376,6 +377,9 @@ class _AssistantScreenState extends State<AssistantScreen> {
     if (question.isEmpty || _isLoading) {
       return;
     }
+    final requestHistory = _conversationHistory.length > 12
+        ? _conversationHistory.sublist(_conversationHistory.length - 12)
+        : List<AssistantHistoryEntry>.of(_conversationHistory);
 
     setState(() {
       _messages.add(_ChatMessage(role: _MessageRole.user, text: question));
@@ -389,6 +393,7 @@ class _AssistantScreenState extends State<AssistantScreen> {
       final answer = await widget.apiClient.ask(
         token: widget.session.token,
         question: question,
+        history: requestHistory,
       );
 
       setState(() {
@@ -396,6 +401,7 @@ class _AssistantScreenState extends State<AssistantScreen> {
         _messages.add(
           _ChatMessage(role: _MessageRole.assistant, text: answer.summary),
         );
+        _rememberConversationTurn(question, answer);
       });
       await _speakAnswer(answer);
     } catch (error) {
@@ -410,6 +416,25 @@ class _AssistantScreenState extends State<AssistantScreen> {
           _isLoading = false;
         });
       }
+    }
+  }
+
+  void _rememberConversationTurn(String question, AssistantAnswer answer) {
+    _conversationHistory.add(
+      AssistantHistoryEntry(role: 'user', text: question),
+    );
+    _conversationHistory.add(
+      AssistantHistoryEntry(
+        role: 'assistant',
+        text: answer.summary,
+        sql: answer.sql,
+        columns: answer.columns,
+        rows: answer.rows.take(3).toList(),
+      ),
+    );
+
+    if (_conversationHistory.length > 16) {
+      _conversationHistory.removeRange(0, _conversationHistory.length - 16);
     }
   }
 
@@ -582,48 +607,74 @@ class _ResultPreview extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    final hasTableData = answer.columns.isNotEmpty;
+
     return Container(
-      constraints: const BoxConstraints(maxHeight: 230),
+      constraints: BoxConstraints(maxHeight: hasTableData ? 230 : 170),
       margin: const EdgeInsets.symmetric(horizontal: 16),
       decoration: BoxDecoration(
         color: Theme.of(context).colorScheme.surface,
         border: Border.all(color: Theme.of(context).dividerColor),
         borderRadius: BorderRadius.circular(8),
       ),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.stretch,
-        children: [
-          Padding(
-            padding: const EdgeInsets.all(12),
-            child: Text(
-              answer.sql,
-              style: Theme.of(
-                context,
-              ).textTheme.bodySmall?.copyWith(fontFamily: 'monospace'),
-            ),
-          ),
-          const Divider(height: 1),
-          Expanded(
-            child: SingleChildScrollView(
-              scrollDirection: Axis.horizontal,
-              child: SingleChildScrollView(
-                child: DataTable(
-                  columns: [
-                    for (final column in answer.columns)
-                      DataColumn(label: Text(column)),
-                  ],
-                  rows: [
-                    for (final row in answer.rows)
-                      DataRow(
-                        cells: [for (final value in row) DataCell(Text(value))],
-                      ),
-                  ],
+      child: hasTableData
+          ? Column(
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              children: [
+                Padding(
+                  padding: const EdgeInsets.all(12),
+                  child: Text(
+                    answer.sql.isEmpty ? answer.summary : answer.sql,
+                    style: Theme.of(
+                      context,
+                    ).textTheme.bodySmall?.copyWith(fontFamily: 'monospace'),
+                  ),
                 ),
-              ),
+                const Divider(height: 1),
+                Expanded(
+                  child: SingleChildScrollView(
+                    scrollDirection: Axis.horizontal,
+                    child: SingleChildScrollView(
+                      child: DataTable(
+                        columns: [
+                          for (final column in answer.columns)
+                            DataColumn(label: Text(column)),
+                        ],
+                        rows: [
+                          for (final row in answer.rows)
+                            DataRow(
+                              cells: [
+                                for (final value in row) DataCell(Text(value)),
+                              ],
+                            ),
+                        ],
+                      ),
+                    ),
+                  ),
+                ),
+              ],
+            )
+          : SingleChildScrollView(
+            padding: const EdgeInsets.all(12),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              children: [
+                Text(
+                  answer.sql.isEmpty ? answer.summary : answer.sql,
+                  style: Theme.of(
+                    context,
+                  ).textTheme.bodySmall?.copyWith(fontFamily: 'monospace'),
+                ),
+                if (answer.sql.isNotEmpty && answer.summary.isNotEmpty) ...[
+                  const SizedBox(height: 12),
+                  Text(
+                    answer.summary,
+                    style: Theme.of(context).textTheme.bodySmall,
+                  ),
+                ],
+              ],
             ),
           ),
-        ],
-      ),
     );
   }
 }
