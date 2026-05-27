@@ -14,3 +14,9 @@ api/.vs/
 api/bin/
 api/obj/
 publish/
+node_modules/
+*.tsbuildinfo
+web/.next/
+web/out/
+web/.env.local
+web/.verification/

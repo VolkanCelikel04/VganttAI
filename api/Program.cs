@@ -158,7 +158,6 @@ static async Task<HttpResponseData> RouteAsync(HttpRequestData request)
     if (request.Method == "GET" &&
         (request.Path == "/admin/dashboard" ||
          request.Path == "/admin/settings/views" ||
-         request.Path == "/admin/settings/columns" ||
          request.Path == "/admin/settings/relations" ||
          request.Path == "/admin/sales-views"))
     {
@@ -170,8 +169,7 @@ static async Task<HttpResponseData> RouteAsync(HttpRequestData request)
 
         var activePage = request.Path switch
         {
-            "/admin/dashboard" => "dashboard",
-            "/admin/settings/columns" => "columns",
+            "/admin/dashboard" => "views",
             "/admin/settings/relations" => "relations",
             _ => "views"
         };
@@ -372,7 +370,7 @@ static async Task<HttpResponseData> RouteAdminApiAsync(HttpRequestData request)
         return HttpResponseData.Json(HttpStatusCode.OK, await LoadAdminViewsAsync(session.TenantId));
     }
 
-    if (request.Method == "POST" && request.Path == "/admin/api/views")
+    if ((request.Method == "POST" || request.Method == "PUT") && request.Path == "/admin/api/views")
     {
         var view = request.ReadJson<SaveAdminViewRequest>();
         if (view is null || string.IsNullOrWhiteSpace(view.ViewName))
@@ -380,7 +378,32 @@ static async Task<HttpResponseData> RouteAdminApiAsync(HttpRequestData request)
             return HttpResponseData.Json(HttpStatusCode.BadRequest, new { message = "view_name is required." });
         }
 
-        return HttpResponseData.Json(HttpStatusCode.OK, await SaveAdminViewAsync(session, view));
+        try
+        {
+            return HttpResponseData.Json(HttpStatusCode.OK, await SaveAdminViewAsync(session, view));
+        }
+        catch (InvalidOperationException error)
+        {
+            return HttpResponseData.Json(HttpStatusCode.BadRequest, new { message = error.Message });
+        }
+    }
+
+    if (request.Method == "DELETE" && request.Path == "/admin/api/views")
+    {
+        if (!Guid.TryParse(request.QueryValue("viewId"), out var viewId))
+        {
+            return HttpResponseData.Json(HttpStatusCode.BadRequest, new { message = "viewId is required." });
+        }
+
+        try
+        {
+            await DeleteAdminViewAsync(session, viewId);
+            return HttpResponseData.Json(HttpStatusCode.OK, new { deleted = true });
+        }
+        catch (InvalidOperationException error)
+        {
+            return HttpResponseData.Json(HttpStatusCode.Conflict, new { message = error.Message });
+        }
     }
 
     if (request.Method == "GET" && request.Path == "/admin/api/view-columns")
@@ -420,7 +443,7 @@ static async Task<HttpResponseData> RouteAdminApiAsync(HttpRequestData request)
         return HttpResponseData.Json(HttpStatusCode.OK, await LoadAdminRelationsAsync(session.TenantId));
     }
 
-    if (request.Method == "POST" && request.Path == "/admin/api/relations")
+    if ((request.Method == "POST" || request.Method == "PUT") && request.Path == "/admin/api/relations")
     {
         var relation = request.ReadJson<SaveAdminRelationRequest>();
         if (relation is null ||
@@ -434,6 +457,24 @@ static async Task<HttpResponseData> RouteAdminApiAsync(HttpRequestData request)
         }
 
         return HttpResponseData.Json(HttpStatusCode.OK, await SaveAdminRelationAsync(session, relation));
+    }
+
+    if (request.Method == "DELETE" && request.Path == "/admin/api/relations")
+    {
+        if (!Guid.TryParse(request.QueryValue("relationId"), out var relationId))
+        {
+            return HttpResponseData.Json(HttpStatusCode.BadRequest, new { message = "relationId is required." });
+        }
+
+        try
+        {
+            await DeleteAdminRelationAsync(session, relationId);
+            return HttpResponseData.Json(HttpStatusCode.OK, new { deleted = true });
+        }
+        catch (InvalidOperationException error)
+        {
+            return HttpResponseData.Json(HttpStatusCode.Conflict, new { message = error.Message });
+        }
     }
 
     return HttpResponseData.Json(HttpStatusCode.NotFound, new { message = "Not found." });
@@ -687,17 +728,14 @@ static string BuildAdminAppPage(AuthenticatedUser session, string activePage)
     var role = WebUtility.HtmlEncode(session.Role);
     var activePageJson = JsonSerializer.Serialize(activePage, AppJson.Options);
     var viewsActive = activePage == "views" ? "active" : "";
-    var columnsActive = activePage == "columns" ? "active" : "";
     var relationsActive = activePage == "relations" ? "active" : "";
     var pageTitle = activePage switch
     {
-        "columns" => "Kolonlar",
         "relations" => "Iliskiler",
         _ => "Viewler"
     };
     var pageSubtitle = activePage switch
     {
-        "columns" => "Secili view icin kolon sozlugunu yonetin.",
         "relations" => "Viewler arasindaki iliskileri yonetin.",
         _ => "ERP view tanimlarini yonetin."
     };
@@ -728,8 +766,8 @@ static string BuildAdminAppPage(AuthenticatedUser session, string activePage)
 
     * { box-sizing: border-box; }
     body { margin: 0; background: #f4f6f8; }
-    .app-shell { min-height: 100vh; display: grid; grid-template-columns: 240px minmax(0, 1fr); }
-    .sidebar { background: #18232f; color: #f9fafb; padding: 18px 14px; }
+    .app-shell { min-height: 100vh; display: grid; grid-template-columns: minmax(0, 1fr); }
+    .sidebar { display: none; }
     .brand { display: grid; gap: 2px; padding: 8px 8px 18px; border-bottom: 1px solid rgba(255,255,255,.14); }
     .brand strong { font-size: 18px; }
     .brand span { color: #b8c4cc; font-size: 12px; }
@@ -739,11 +777,11 @@ static string BuildAdminAppPage(AuthenticatedUser session, string activePage)
     .nav-item.active { background: rgba(255,255,255,.14); }
     .nav-item:hover { background: rgba(255,255,255,.09); }
     .content { min-width: 0; }
-    .topbar { min-height: 65px; background: var(--surface); border-bottom: 1px solid var(--line); display: flex; align-items: center; justify-content: space-between; gap: 16px; padding: 14px 24px; }
+    .topbar { display: none; }
     h1 { font-size: 24px; margin: 0 0 4px; }
     h2 { font-size: 18px; margin: 0 0 12px; }
     p { margin: 0; color: var(--muted); }
-    main { width: min(1280px, calc(100% - 32px)); margin: 24px auto; display: grid; gap: 16px; }
+    main { width: min(1280px, calc(100% - 32px)); margin: 12px auto; display: grid; gap: 16px; }
     .user-meta { display: grid; gap: 8px; color: var(--muted); font-size: 13px; text-align: right; }
     .logout { color: var(--primary); font-weight: 700; text-decoration: none; border: 0; background: transparent; cursor: pointer; padding: 0; }
     .section { background: var(--surface); border: 1px solid var(--line); border-radius: 8px; padding: 20px; }
@@ -768,6 +806,8 @@ static string BuildAdminAppPage(AuthenticatedUser session, string activePage)
     th { color: #344054; font-size: 13px; background: #f8fafc; }
     td.mono { font-family: Consolas, monospace; font-size: 13px; }
     .table-wrap { overflow: auto; border: 1px solid var(--line); border-radius: 8px; }
+    .views-table-wrap { max-height: calc(100vh - 112px); }
+    .views-table-wrap th { position: sticky; top: 0; z-index: 1; }
     tbody tr { cursor: pointer; }
     tbody tr:hover { background: #f8fafc; }
     tbody tr.is-selected { background: #eef8f5; }
@@ -793,7 +833,7 @@ static string BuildAdminAppPage(AuthenticatedUser session, string activePage)
       .app-shell, .grid-2, .stats, .relation-column-row { grid-template-columns: 1fr; }
       .form-section { position: static; }
       .sidebar { padding: 12px; }
-      .topbar, .toolbar { display: grid; }
+      .toolbar { display: grid; }
       .user-meta { text-align: left; }
     }
   </style>
@@ -808,7 +848,6 @@ static string BuildAdminAppPage(AuthenticatedUser session, string activePage)
       <nav class="nav-section">
         <p class="nav-title">Admin</p>
         <a class="nav-item {{viewsActive}}" href="/admin/settings/views">Viewler</a>
-        <a class="nav-item {{columnsActive}}" href="/admin/settings/columns">Kolonlar</a>
         <a class="nav-item {{relationsActive}}" href="/admin/settings/relations">Iliskiler</a>
       </nav>
     </aside>
@@ -845,54 +884,10 @@ static string BuildAdminAppPage(AuthenticatedUser session, string activePage)
               <h2>View Listesi</h2>
               <button id="refreshViewsButton" class="secondary" type="button">Yenile</button>
             </div>
-            <div class="table-wrap">
+            <div class="table-wrap views-table-wrap">
               <table>
                 <thead><tr><th>ID</th><th>Teknik Ad</th><th>Ekran Adi</th><th>Durum</th><th>Islem</th></tr></thead>
                 <tbody id="viewsBody"></tbody>
-              </table>
-            </div>
-          </div>
-        </section>
-        <section id="columnsPage" class="grid-2 hidden">
-          <div class="section form-section">
-            <h2>Kolon Bilgisi</h2>
-            <form id="columnForm">
-              <label>View<select id="columnsViewSelect"></select></label>
-              <label>Veritabanindaki Kolon Adi<input id="columnNameInput" placeholder="order_no" required></label>
-              <label>Ekran Adi<input id="columnDisplayNameInput" placeholder="Siparis No"></label>
-              <label>AI Anlami<textarea id="columnSemanticInput" placeholder="Kolon anlami"></textarea></label>
-              <details class="advanced">
-                <summary>Gelismis ayarlar</summary>
-                <div class="advanced-body">
-                  <label>Veri Tipi<input id="columnDataTypeInput" placeholder="text"></label>
-                  <div class="check-row">
-                    <label><input id="columnFilterableInput" type="checkbox" checked> Filtre</label>
-                    <label><input id="columnGroupableInput" type="checkbox" checked> Gruplama</label>
-                    <label><input id="columnSummableInput" type="checkbox"> Toplam</label>
-                    <label><input id="columnActiveInput" type="checkbox" checked> Aktif</label>
-                  </div>
-                </div>
-              </details>
-              <div class="button-row">
-                <button class="primary" type="submit">Kaydet</button>
-                <button id="newColumnButton" class="secondary" type="button">Yeni</button>
-              </div>
-              <div id="columnsMessage" class="message" role="status"></div>
-            </form>
-          </div>
-          <div class="section">
-            <div class="toolbar">
-              <h2>Kolon Listesi</h2>
-              <button id="refreshColumnsButton" class="secondary" type="button">Yenile</button>
-            </div>
-            <div class="table-wrap">
-              <table>
-                <thead>
-                  <tr>
-                    <th>Teknik Ad</th><th>Ekran Adi</th><th>Veri Tipi</th><th>Durum</th><th>Islem</th>
-                  </tr>
-                </thead>
-                <tbody id="columnsBody"></tbody>
               </table>
             </div>
           </div>
@@ -1047,7 +1042,7 @@ static string BuildAdminAppPage(AuthenticatedUser session, string activePage)
     }
 
     function showPage(page) {
-      for (const id of ['viewsPage', 'columnsPage', 'relationsPage']) {
+      for (const id of ['viewsPage', 'relationsPage']) {
         const section = document.getElementById(id);
         if (section) section.classList.add('hidden');
       }
@@ -1423,9 +1418,6 @@ static string BuildAdminAppPage(AuthenticatedUser session, string activePage)
     async function boot() {
       showPage(activePage);
       await loadViews();
-      if (activePage === 'columns') {
-        await loadColumnsForSelectedView();
-      }
       if (activePage === 'relations') {
         clearRelationForm();
         await loadRelations();
@@ -2212,7 +2204,7 @@ static async Task<string> BuildColumnMeaningsPageAsync(AuthenticatedUser session
 
     @media (max-width: 720px) {
       .app-shell { grid-template-columns: 1fr; }
-      .topbar, .toolbar { display: grid; }
+      .toolbar { display: grid; }
       .user-meta { text-align: left; }
       table, thead, tbody, tr, th, td { display: block; }
       th { display: none; }
@@ -3324,7 +3316,10 @@ static async Task<AdminViewResponse> SaveAdminViewAsync(AuthenticatedUser sessio
 
     await using var connection = await OpenRegistryConnectionAsync();
     await using var transaction = await connection.BeginTransactionAsync();
+    await EnsureAdminColumnMetadataFieldsAsync(connection, transaction);
 
+    var tenantConnection = await LoadActiveTenantDbConnectionForUpdateAsync(connection, transaction, session.TenantId)
+        ?? throw new InvalidOperationException("Aktif müşteri veritabanı bağlantısı tanımlı değil.");
     var connectionId = await GetActiveTenantConnectionIdAsync(connection, transaction, session.TenantId);
     NpgsqlCommand command;
     if (request.ViewId is Guid viewId && viewId != Guid.Empty)
@@ -3414,15 +3409,375 @@ static async Task<AdminViewResponse> SaveAdminViewAsync(AuthenticatedUser sessio
             );
         }
 
+        var tenantColumns = await LoadTenantViewColumnsAsync(tenantConnection, saved.ViewName);
+        if (tenantColumns.Length == 0)
+        {
+            throw new InvalidOperationException($"Müşteri veritabanında view bulunamadı veya kolon okunamadı: {saved.ViewName}");
+        }
+
+        await SyncAdminViewColumnsFromTenantDbAsync(connection, transaction, saved.ViewId, tenantColumns);
+
         await transaction.CommitAsync();
         return saved;
     }
+}
+
+static async Task DeleteAdminViewAsync(AuthenticatedUser session, Guid viewId)
+{
+    await using var connection = await OpenRegistryConnectionAsync();
+    await using var transaction = await connection.BeginTransactionAsync();
+
+    await EnsureTenantViewAsync(connection, transaction, session.TenantId, viewId);
+
+    await using (var relationCommand = new NpgsqlCommand("""
+        select count(*)
+        from tenant_erp_relations
+        where tenant_id = @tenant_id
+          and (source_view_id = @view_id or target_view_id = @view_id)
+        """, connection, transaction))
+    {
+        relationCommand.Parameters.AddWithValue("tenant_id", session.TenantId);
+        relationCommand.Parameters.AddWithValue("view_id", viewId);
+        var relationCount = (long)(await relationCommand.ExecuteScalarAsync() ?? 0L);
+        if (relationCount > 0)
+        {
+            throw new InvalidOperationException("This view is used in one or more relations and cannot be deleted.");
+        }
+    }
+
+    await using (var legacyRelationCommand = new NpgsqlCommand("""
+        select count(*)
+        from tenant_erp_object_relationships
+        where tenant_id = @tenant_id
+          and (parent_object_id = @view_id or child_object_id = @view_id)
+          and is_active = true
+        """, connection, transaction))
+    {
+        legacyRelationCommand.Parameters.AddWithValue("tenant_id", session.TenantId);
+        legacyRelationCommand.Parameters.AddWithValue("view_id", viewId);
+        var legacyRelationCount = (long)(await legacyRelationCommand.ExecuteScalarAsync() ?? 0L);
+        if (legacyRelationCount > 0)
+        {
+            throw new InvalidOperationException("This view is used in legacy relationships and cannot be deleted.");
+        }
+    }
+
+    await using (var deleteCommand = new NpgsqlCommand("""
+        delete from tenant_erp_objects
+        where tenant_id = @tenant_id
+          and id = @view_id
+          and object_type = 'view'
+        """, connection, transaction))
+    {
+        deleteCommand.Parameters.AddWithValue("tenant_id", session.TenantId);
+        deleteCommand.Parameters.AddWithValue("view_id", viewId);
+        var deletedCount = await deleteCommand.ExecuteNonQueryAsync();
+        if (deletedCount == 0)
+        {
+            throw new InvalidOperationException("View not found for this tenant.");
+        }
+    }
+
+    await transaction.CommitAsync();
+}
+
+static async Task<TenantViewColumn[]> LoadTenantViewColumnsAsync(
+    TenantDbConnectionSettings settings,
+    string viewName
+)
+{
+    return settings.Provider.Trim().ToLowerInvariant() switch
+    {
+        "oracle" => await LoadOracleViewColumnsAsync(settings, viewName),
+        "postgresql" => await LoadPostgresViewColumnsAsync(settings, viewName),
+        _ => throw new InvalidOperationException($"Müşteri veritabanı provider desteklenmiyor: {settings.Provider}")
+    };
+}
+
+static async Task<TenantViewColumn[]> LoadOracleViewColumnsAsync(
+    TenantDbConnectionSettings settings,
+    string viewName
+)
+{
+    var objectName = ParseDbObjectName(viewName);
+    await using var connection = new OracleConnection(BuildTenantOracleConnectionString(settings));
+    await connection.OpenAsync();
+    await using var command = connection.CreateCommand();
+    command.BindByName = true;
+    command.CommandText = """
+        select
+            owner,
+            table_name,
+            column_name,
+            data_type,
+            column_id
+        from all_tab_columns
+        where (table_name = :object_name_exact or upper(table_name) = :object_name_upper)
+          and (
+              :owner_name_exact is null
+              or owner = :owner_name_exact
+              or upper(owner) = :owner_name_upper
+          )
+        order by
+            case
+                when upper(owner) = upper(sys_context('USERENV', 'CURRENT_SCHEMA')) then 0
+                when upper(owner) = upper(user) then 1
+                else 2
+            end,
+            owner,
+            table_name,
+            column_id
+        """;
+    command.Parameters.Add(new OracleParameter("object_name_exact", objectName.ObjectName));
+    command.Parameters.Add(new OracleParameter("object_name_upper", objectName.ObjectName.ToUpperInvariant()));
+    command.Parameters.Add(new OracleParameter("owner_name_exact", (object?)objectName.SchemaName ?? DBNull.Value));
+    command.Parameters.Add(new OracleParameter("owner_name_upper", (object?)objectName.SchemaName?.ToUpperInvariant() ?? DBNull.Value));
+
+    await using var reader = await command.ExecuteReaderAsync();
+    var selectedOwner = string.Empty;
+    var selectedTable = string.Empty;
+    var columns = new List<TenantViewColumn>();
+    while (await reader.ReadAsync())
+    {
+        var owner = reader.GetString(0);
+        var table = reader.GetString(1);
+        if (columns.Count == 0)
+        {
+            selectedOwner = owner;
+            selectedTable = table;
+        }
+        else if (!string.Equals(selectedOwner, owner, StringComparison.Ordinal) ||
+                 !string.Equals(selectedTable, table, StringComparison.Ordinal))
+        {
+            break;
+        }
+
+        columns.Add(new TenantViewColumn(
+            ColumnName: reader.GetString(2),
+            DataType: reader.GetString(3),
+            Ordinal: Convert.ToInt32(reader.GetValue(4), CultureInfo.InvariantCulture)
+        ));
+    }
+
+    return columns.ToArray();
+}
+
+static async Task<TenantViewColumn[]> LoadPostgresViewColumnsAsync(
+    TenantDbConnectionSettings settings,
+    string viewName
+)
+{
+    var objectName = ParseDbObjectName(viewName);
+    await using var connection = new NpgsqlConnection(BuildTenantConnectionString(settings));
+    await connection.OpenAsync();
+    await using var command = new NpgsqlCommand("""
+        select
+            table_schema,
+            table_name,
+            column_name,
+            data_type,
+            ordinal_position
+        from information_schema.columns
+        where (table_name = @object_name_exact or lower(table_name) = lower(@object_name_exact))
+          and (
+              @schema_name_exact is null
+              or table_schema = @schema_name_exact
+              or lower(table_schema) = lower(@schema_name_exact)
+          )
+        order by
+            case
+                when table_schema = current_schema() then 0
+                when table_schema = 'public' then 1
+                else 2
+            end,
+            table_schema,
+            table_name,
+            ordinal_position
+        """, connection);
+    command.Parameters.AddWithValue("object_name_exact", objectName.ObjectName);
+    command.Parameters.AddWithValue("schema_name_exact", (object?)objectName.SchemaName ?? DBNull.Value);
+
+    await using var reader = await command.ExecuteReaderAsync();
+    var selectedSchema = string.Empty;
+    var selectedTable = string.Empty;
+    var columns = new List<TenantViewColumn>();
+    while (await reader.ReadAsync())
+    {
+        var schema = reader.GetString(0);
+        var table = reader.GetString(1);
+        if (columns.Count == 0)
+        {
+            selectedSchema = schema;
+            selectedTable = table;
+        }
+        else if (!string.Equals(selectedSchema, schema, StringComparison.Ordinal) ||
+                 !string.Equals(selectedTable, table, StringComparison.Ordinal))
+        {
+            break;
+        }
+
+        columns.Add(new TenantViewColumn(
+            ColumnName: reader.GetString(2),
+            DataType: reader.GetString(3),
+            Ordinal: reader.GetInt32(4)
+        ));
+    }
+
+    return columns.ToArray();
+}
+
+static DbObjectName ParseDbObjectName(string value)
+{
+    var trimmed = value.Trim().TrimEnd(';');
+    var separatorIndex = trimmed.LastIndexOf('.');
+    if (separatorIndex <= 0 || separatorIndex == trimmed.Length - 1)
+    {
+        return new DbObjectName(null, TrimDbIdentifier(trimmed));
+    }
+
+    return new DbObjectName(
+        SchemaName: TrimDbIdentifier(trimmed[..separatorIndex]),
+        ObjectName: TrimDbIdentifier(trimmed[(separatorIndex + 1)..])
+    );
+}
+
+static string TrimDbIdentifier(string value)
+{
+    return value.Trim().Trim('"').Trim('[', ']').Trim('`').Trim();
+}
+
+static async Task SyncAdminViewColumnsFromTenantDbAsync(
+    NpgsqlConnection connection,
+    NpgsqlTransaction transaction,
+    Guid viewId,
+    TenantViewColumn[] columns
+)
+{
+    await using (var deactivateCommand = new NpgsqlCommand("""
+        update tenant_erp_object_columns
+        set is_active = false,
+            updated_at = now()
+        where object_id = @object_id
+        """, connection, transaction))
+    {
+        deactivateCommand.Parameters.AddWithValue("object_id", viewId);
+        await deactivateCommand.ExecuteNonQueryAsync();
+    }
+
+    foreach (var column in columns.OrderBy(column => column.Ordinal))
+    {
+        await using var command = new NpgsqlCommand("""
+            insert into tenant_erp_object_columns (
+                object_id,
+                column_name,
+                data_type,
+                business_name,
+                display_name_tr,
+                description,
+                semantic_meaning_tr,
+                is_sensitive,
+                is_filterable,
+                is_groupable,
+                is_summable,
+                is_active,
+                updated_at
+            )
+            values (
+                @object_id,
+                @column_name,
+                @data_type,
+                @business_name,
+                null,
+                null,
+                null,
+                false,
+                true,
+                true,
+                @is_summable,
+                true,
+                now()
+            )
+            on conflict (object_id, column_name) do update
+            set data_type = excluded.data_type,
+                business_name = excluded.business_name,
+                display_name_tr = tenant_erp_object_columns.display_name_tr,
+                description = tenant_erp_object_columns.description,
+                semantic_meaning_tr = tenant_erp_object_columns.semantic_meaning_tr,
+                is_filterable = tenant_erp_object_columns.is_filterable,
+                is_groupable = tenant_erp_object_columns.is_groupable,
+                is_summable = excluded.is_summable,
+                is_active = true,
+                updated_at = now()
+            """, connection, transaction);
+
+        command.Parameters.AddWithValue("object_id", viewId);
+        command.Parameters.AddWithValue("column_name", column.ColumnName);
+        var dataType = column.DataType ?? string.Empty;
+        command.Parameters.AddWithValue("data_type", string.IsNullOrWhiteSpace(dataType) ? DBNull.Value : dataType);
+        command.Parameters.AddWithValue("business_name", column.ColumnName);
+        command.Parameters.AddWithValue("is_summable", LooksSummableColumn(column.ColumnName, dataType));
+        await command.ExecuteNonQueryAsync();
+    }
+}
+
+static bool LooksSummableColumn(string columnName, string dataType)
+{
+    return Regex.IsMatch(columnName, "(amount|total|qty|quantity|tutar|adet|miktar|price|cost)", RegexOptions.IgnoreCase) ||
+        Regex.IsMatch(dataType, "(number|numeric|decimal|integer|bigint|smallint|double|real)", RegexOptions.IgnoreCase);
+}
+
+static async Task EnsureAdminColumnMetadataFieldsAsync(
+    NpgsqlConnection connection,
+    NpgsqlTransaction? transaction = null
+)
+{
+    const string sql = """
+        alter table tenant_erp_object_columns
+            add column if not exists display_name_tr text;
+
+        alter table tenant_erp_object_columns
+            add column if not exists semantic_meaning_tr text;
+
+        alter table tenant_erp_object_columns
+            add column if not exists is_summable boolean not null default false;
+        """;
+
+    await using var command = transaction is null
+        ? new NpgsqlCommand(sql, connection)
+        : new NpgsqlCommand(sql, connection, transaction);
+    await command.ExecuteNonQueryAsync();
+}
+
+static async Task EnsureAdminRelationRegionFieldsAsync(
+    NpgsqlConnection connection,
+    NpgsqlTransaction? transaction = null
+)
+{
+    const string sql = """
+        alter table tenant_erp_relations
+            add column if not exists source_region_type text not null default 'view';
+
+        alter table tenant_erp_relations
+            add column if not exists source_relation_id uuid;
+
+        alter table tenant_erp_relations
+            add column if not exists target_region_type text not null default 'view';
+
+        alter table tenant_erp_relations
+            add column if not exists target_relation_id uuid;
+        """;
+
+    await using var command = transaction is null
+        ? new NpgsqlCommand(sql, connection)
+        : new NpgsqlCommand(sql, connection, transaction);
+    await command.ExecuteNonQueryAsync();
 }
 
 static async Task<AdminViewColumnResponse[]> LoadAdminViewColumnsAsync(Guid tenantId, Guid viewId)
 {
     var columns = new List<AdminViewColumnResponse>();
     await using var connection = await OpenRegistryConnectionAsync();
+    await EnsureAdminColumnMetadataFieldsAsync(connection);
     await using var command = new NpgsqlCommand("""
         select
             c.id,
@@ -3486,6 +3841,7 @@ static async Task<SaveAdminViewColumnsResponse> SaveAdminViewColumnsAsync(
 
     await using var connection = await OpenRegistryConnectionAsync();
     await using var transaction = await connection.BeginTransactionAsync();
+    await EnsureAdminColumnMetadataFieldsAsync(connection, transaction);
     await EnsureTenantViewAsync(connection, transaction, session.TenantId, request.ViewId);
 
     var savedCount = 0;
@@ -3775,6 +4131,7 @@ static async Task<AdminRelationResponse[]> LoadAdminRelationsAsync(Guid tenantId
 {
     var relations = new Dictionary<Guid, AdminRelationResponseBuilder>();
     await using var connection = await OpenRegistryConnectionAsync();
+    await EnsureAdminRelationRegionFieldsAsync(connection);
     await using var command = new NpgsqlCommand("""
         select
             r.id,
@@ -3786,6 +4143,12 @@ static async Task<AdminRelationResponse[]> LoadAdminRelationsAsync(Guid tenantId
             r.join_type,
             coalesce(r.description_tr, ''),
             r.is_active,
+            coalesce(r.source_region_type, 'view'),
+            r.source_relation_id,
+            coalesce(source_region_relation.relation_name, source_view.object_name),
+            coalesce(r.target_region_type, 'view'),
+            r.target_relation_id,
+            coalesce(target_region_relation.relation_name, target_view.object_name),
             rc.id,
             rc.source_column_name,
             rc.target_column_name,
@@ -3793,6 +4156,12 @@ static async Task<AdminRelationResponse[]> LoadAdminRelationsAsync(Guid tenantId
         from tenant_erp_relations r
         join tenant_erp_objects source_view on source_view.id = r.source_view_id
         join tenant_erp_objects target_view on target_view.id = r.target_view_id
+        left join tenant_erp_relations source_region_relation
+          on source_region_relation.id = r.source_relation_id
+         and source_region_relation.tenant_id = r.tenant_id
+        left join tenant_erp_relations target_region_relation
+          on target_region_relation.id = r.target_relation_id
+         and target_region_relation.tenant_id = r.tenant_id
         left join tenant_erp_relation_columns rc on rc.relation_id = r.id
         where r.tenant_id = @tenant_id
         order by r.relation_name, rc.ordinal
@@ -3815,18 +4184,24 @@ static async Task<AdminRelationResponse[]> LoadAdminRelationsAsync(Guid tenantId
                 TargetViewName: reader.GetString(5),
                 JoinType: reader.GetString(6),
                 DescriptionTr: reader.GetString(7),
-                IsActive: reader.GetBoolean(8)
+                IsActive: reader.GetBoolean(8),
+                SourceRegionType: reader.GetString(9),
+                SourceRelationId: reader.IsDBNull(10) ? null : reader.GetGuid(10),
+                SourceRegionName: reader.GetString(11),
+                TargetRegionType: reader.GetString(12),
+                TargetRelationId: reader.IsDBNull(13) ? null : reader.GetGuid(13),
+                TargetRegionName: reader.GetString(14)
             );
             relations[relationId] = relation;
         }
 
-        if (!reader.IsDBNull(9))
+        if (!reader.IsDBNull(15))
         {
             relation.Columns.Add(new AdminRelationColumnResponse(
-                RelationColumnId: reader.GetGuid(9),
-                SourceColumnName: reader.GetString(10),
-                TargetColumnName: reader.GetString(11),
-                Ordinal: reader.GetInt32(12)
+                RelationColumnId: reader.GetGuid(15),
+                SourceColumnName: reader.GetString(16),
+                TargetColumnName: reader.GetString(17),
+                Ordinal: reader.GetInt32(18)
             ));
         }
     }
@@ -3843,6 +4218,10 @@ static async Task<AdminRelationResponse> SaveAdminRelationAsync(
 {
     var relationName = request.RelationName.Trim();
     var joinType = NormalizeJoinType(request.JoinType);
+    var sourceRegionType = NormalizeRelationRegionType(request.SourceRegionType);
+    var targetRegionType = NormalizeRelationRegionType(request.TargetRegionType);
+    var sourceRelationId = sourceRegionType == "relation" ? request.SourceRelationId : null;
+    var targetRelationId = targetRegionType == "relation" ? request.TargetRelationId : null;
     var descriptionTr = request.DescriptionTr?.Trim();
     var columns = (request.Columns ?? [])
         .Where(column =>
@@ -3863,11 +4242,28 @@ static async Task<AdminRelationResponse> SaveAdminRelationAsync(
         throw new InvalidOperationException("At least one relation column is required.");
     }
 
+    if (sourceRegionType == "relation" && sourceRelationId is null)
+    {
+        throw new InvalidOperationException("1. bölge için kayıtlı relation seçimi gereklidir.");
+    }
+
+    if (targetRegionType == "relation" && targetRelationId is null)
+    {
+        throw new InvalidOperationException("2. bölge için kayıtlı relation seçimi gereklidir.");
+    }
+
     await using var connection = await OpenRegistryConnectionAsync();
     await using var transaction = await connection.BeginTransactionAsync();
+    await EnsureAdminRelationRegionFieldsAsync(connection, transaction);
 
     var sourceViewName = await EnsureTenantViewAsync(connection, transaction, session.TenantId, request.SourceViewId);
     var targetViewName = await EnsureTenantViewAsync(connection, transaction, session.TenantId, request.TargetViewId);
+    var sourceRegionName = sourceRegionType == "relation"
+        ? await EnsureTenantRelationAsync(connection, transaction, session.TenantId, sourceRelationId!.Value, request.RelationId)
+        : sourceViewName;
+    var targetRegionName = targetRegionType == "relation"
+        ? await EnsureTenantRelationAsync(connection, transaction, session.TenantId, targetRelationId!.Value, request.RelationId)
+        : targetViewName;
 
     Guid relationId;
     if (request.RelationId is Guid existingRelationId && existingRelationId != Guid.Empty)
@@ -3877,6 +4273,10 @@ static async Task<AdminRelationResponse> SaveAdminRelationAsync(
             set relation_name = @relation_name,
                 source_view_id = @source_view_id,
                 target_view_id = @target_view_id,
+                source_region_type = @source_region_type,
+                source_relation_id = @source_relation_id,
+                target_region_type = @target_region_type,
+                target_relation_id = @target_relation_id,
                 join_type = @join_type,
                 description_tr = @description_tr,
                 is_active = @is_active,
@@ -3891,6 +4291,10 @@ static async Task<AdminRelationResponse> SaveAdminRelationAsync(
         updateCommand.Parameters.AddWithValue("relation_name", relationName);
         updateCommand.Parameters.AddWithValue("source_view_id", request.SourceViewId);
         updateCommand.Parameters.AddWithValue("target_view_id", request.TargetViewId);
+        updateCommand.Parameters.AddWithValue("source_region_type", sourceRegionType);
+        updateCommand.Parameters.AddWithValue("source_relation_id", sourceRelationId.HasValue ? sourceRelationId.Value : DBNull.Value);
+        updateCommand.Parameters.AddWithValue("target_region_type", targetRegionType);
+        updateCommand.Parameters.AddWithValue("target_relation_id", targetRelationId.HasValue ? targetRelationId.Value : DBNull.Value);
         updateCommand.Parameters.AddWithValue("join_type", joinType);
         updateCommand.Parameters.AddWithValue("description_tr", (object?)descriptionTr ?? DBNull.Value);
         updateCommand.Parameters.AddWithValue("is_active", request.IsActive);
@@ -3905,6 +4309,10 @@ static async Task<AdminRelationResponse> SaveAdminRelationAsync(
                 relation_name,
                 source_view_id,
                 target_view_id,
+                source_region_type,
+                source_relation_id,
+                target_region_type,
+                target_relation_id,
                 join_type,
                 description_tr,
                 is_active,
@@ -3915,6 +4323,10 @@ static async Task<AdminRelationResponse> SaveAdminRelationAsync(
                 @relation_name,
                 @source_view_id,
                 @target_view_id,
+                @source_region_type,
+                @source_relation_id,
+                @target_region_type,
+                @target_relation_id,
                 @join_type,
                 @description_tr,
                 @is_active,
@@ -3923,6 +4335,10 @@ static async Task<AdminRelationResponse> SaveAdminRelationAsync(
             on conflict (tenant_id, relation_name) do update
             set source_view_id = excluded.source_view_id,
                 target_view_id = excluded.target_view_id,
+                source_region_type = excluded.source_region_type,
+                source_relation_id = excluded.source_relation_id,
+                target_region_type = excluded.target_region_type,
+                target_relation_id = excluded.target_relation_id,
                 join_type = excluded.join_type,
                 description_tr = excluded.description_tr,
                 is_active = excluded.is_active,
@@ -3934,6 +4350,10 @@ static async Task<AdminRelationResponse> SaveAdminRelationAsync(
         insertCommand.Parameters.AddWithValue("relation_name", relationName);
         insertCommand.Parameters.AddWithValue("source_view_id", request.SourceViewId);
         insertCommand.Parameters.AddWithValue("target_view_id", request.TargetViewId);
+        insertCommand.Parameters.AddWithValue("source_region_type", sourceRegionType);
+        insertCommand.Parameters.AddWithValue("source_relation_id", sourceRelationId.HasValue ? sourceRelationId.Value : DBNull.Value);
+        insertCommand.Parameters.AddWithValue("target_region_type", targetRegionType);
+        insertCommand.Parameters.AddWithValue("target_relation_id", targetRelationId.HasValue ? targetRelationId.Value : DBNull.Value);
         insertCommand.Parameters.AddWithValue("join_type", joinType);
         insertCommand.Parameters.AddWithValue("description_tr", (object?)descriptionTr ?? DBNull.Value);
         insertCommand.Parameters.AddWithValue("is_active", request.IsActive);
@@ -3995,6 +4415,12 @@ static async Task<AdminRelationResponse> SaveAdminRelationAsync(
         SourceViewName: sourceViewName,
         TargetViewId: request.TargetViewId,
         TargetViewName: targetViewName,
+        SourceRegionType: sourceRegionType,
+        SourceRelationId: sourceRelationId,
+        SourceRegionName: sourceRegionName,
+        TargetRegionType: targetRegionType,
+        TargetRelationId: targetRelationId,
+        TargetRegionName: targetRegionName,
         JoinType: joinType,
         DescriptionTr: descriptionTr ?? string.Empty,
         IsActive: request.IsActive,
@@ -4005,6 +4431,84 @@ static async Task<AdminRelationResponse> SaveAdminRelationAsync(
             Ordinal: column.Ordinal
         )).ToArray()
     );
+}
+
+static async Task DeleteAdminRelationAsync(AuthenticatedUser session, Guid relationId)
+{
+    await using var connection = await OpenRegistryConnectionAsync();
+    await using var transaction = await connection.BeginTransactionAsync();
+    await EnsureAdminRelationRegionFieldsAsync(connection, transaction);
+
+    await using (var usageCommand = new NpgsqlCommand("""
+        select count(*)
+        from tenant_erp_relations
+        where tenant_id = @tenant_id
+          and id <> @relation_id
+          and (source_relation_id = @relation_id or target_relation_id = @relation_id)
+        """, connection, transaction))
+    {
+        usageCommand.Parameters.AddWithValue("tenant_id", session.TenantId);
+        usageCommand.Parameters.AddWithValue("relation_id", relationId);
+        var usageCount = (long)(await usageCommand.ExecuteScalarAsync() ?? 0L);
+        if (usageCount > 0)
+        {
+            throw new InvalidOperationException("This relation is used in another relation and cannot be deleted.");
+        }
+    }
+
+    Guid sourceViewId;
+    Guid targetViewId;
+    await using (var lookupCommand = new NpgsqlCommand("""
+        select source_view_id, target_view_id
+        from tenant_erp_relations
+        where tenant_id = @tenant_id
+          and id = @relation_id
+        """, connection, transaction))
+    {
+        lookupCommand.Parameters.AddWithValue("tenant_id", session.TenantId);
+        lookupCommand.Parameters.AddWithValue("relation_id", relationId);
+
+        await using var reader = await lookupCommand.ExecuteReaderAsync();
+        if (!await reader.ReadAsync())
+        {
+            throw new InvalidOperationException("Relation not found for this tenant.");
+        }
+
+        sourceViewId = reader.GetGuid(0);
+        targetViewId = reader.GetGuid(1);
+    }
+
+    await using (var legacyCommand = new NpgsqlCommand("""
+        update tenant_erp_object_relationships
+        set is_active = false,
+            updated_at = now()
+        where tenant_id = @tenant_id
+          and parent_object_id = @source_view_id
+          and child_object_id = @target_view_id
+        """, connection, transaction))
+    {
+        legacyCommand.Parameters.AddWithValue("tenant_id", session.TenantId);
+        legacyCommand.Parameters.AddWithValue("source_view_id", sourceViewId);
+        legacyCommand.Parameters.AddWithValue("target_view_id", targetViewId);
+        await legacyCommand.ExecuteNonQueryAsync();
+    }
+
+    await using (var deleteCommand = new NpgsqlCommand("""
+        delete from tenant_erp_relations
+        where tenant_id = @tenant_id
+          and id = @relation_id
+        """, connection, transaction))
+    {
+        deleteCommand.Parameters.AddWithValue("tenant_id", session.TenantId);
+        deleteCommand.Parameters.AddWithValue("relation_id", relationId);
+        var deletedCount = await deleteCommand.ExecuteNonQueryAsync();
+        if (deletedCount == 0)
+        {
+            throw new InvalidOperationException("Relation not found for this tenant.");
+        }
+    }
+
+    await transaction.CommitAsync();
 }
 
 static async Task<string> EnsureTenantViewAsync(
@@ -4027,6 +4531,33 @@ static async Task<string> EnsureTenantViewAsync(
 
     return (string?)await command.ExecuteScalarAsync()
         ?? throw new InvalidOperationException("View not found for this tenant.");
+}
+
+static async Task<string> EnsureTenantRelationAsync(
+    NpgsqlConnection connection,
+    NpgsqlTransaction transaction,
+    Guid tenantId,
+    Guid relationId,
+    Guid? currentRelationId = null
+)
+{
+    if (currentRelationId.HasValue && currentRelationId.Value == relationId)
+    {
+        throw new InvalidOperationException("A relation cannot use itself as a region.");
+    }
+
+    await using var command = new NpgsqlCommand("""
+        select relation_name
+        from tenant_erp_relations
+        where tenant_id = @tenant_id
+          and id = @relation_id
+        """, connection, transaction);
+
+    command.Parameters.AddWithValue("tenant_id", tenantId);
+    command.Parameters.AddWithValue("relation_id", relationId);
+
+    return (string?)await command.ExecuteScalarAsync()
+        ?? throw new InvalidOperationException("Relation not found for this tenant.");
 }
 
 static async Task UpsertColumnMeaningAsync(
@@ -4082,6 +4613,20 @@ static string NormalizeJoinType(string? joinType)
         "RIGHT" or "RIGHT JOIN" => "RIGHT JOIN",
         "FULL" or "FULL JOIN" => "FULL JOIN",
         _ => throw new InvalidOperationException("join_type must be INNER JOIN, LEFT JOIN, RIGHT JOIN or FULL JOIN.")
+    };
+}
+
+static string NormalizeRelationRegionType(string? regionType)
+{
+    var normalized = string.IsNullOrWhiteSpace(regionType)
+        ? "view"
+        : regionType.Trim().ToLowerInvariant();
+
+    return normalized switch
+    {
+        "view" => "view",
+        "relation" => "relation",
+        _ => throw new InvalidOperationException("Region type must be view or relation.")
     };
 }
 
@@ -4441,6 +4986,40 @@ static async Task<TenantDbConnectionSettings?> LoadActiveTenantDbConnectionAsync
         order by id desc
         limit 1
         """, connection);
+
+    command.Parameters.AddWithValue("tenant_id", tenantId);
+
+    await using var reader = await command.ExecuteReaderAsync();
+    if (!await reader.ReadAsync())
+    {
+        return null;
+    }
+
+    return new TenantDbConnectionSettings(
+        Provider: reader.GetString(0),
+        Host: reader.GetString(1),
+        Port: reader.GetInt32(2),
+        DatabaseName: reader.GetString(3),
+        Username: reader.GetString(4),
+        Password: reader.GetString(5),
+        SslMode: reader.GetString(6)
+    );
+}
+
+static async Task<TenantDbConnectionSettings?> LoadActiveTenantDbConnectionForUpdateAsync(
+    NpgsqlConnection connection,
+    NpgsqlTransaction transaction,
+    Guid tenantId
+)
+{
+    await using var command = new NpgsqlCommand("""
+        select provider, host, port, database_name, username, password_value, ssl_mode
+        from tenant_db_connections
+        where tenant_id = @tenant_id
+          and is_active = true
+        order by id desc
+        limit 1
+        """, connection, transaction);
 
     command.Parameters.AddWithValue("tenant_id", tenantId);
 
@@ -6539,7 +7118,7 @@ sealed record HttpResponseData(
             $"Content-Length: {bodyBytes.Length}",
             "Access-Control-Allow-Origin: *",
             "Access-Control-Allow-Headers: authorization,content-type",
-            "Access-Control-Allow-Methods: GET,POST,OPTIONS",
+            "Access-Control-Allow-Methods: GET,POST,PUT,DELETE,OPTIONS",
             "Connection: close"
         };
 
@@ -6985,6 +7564,14 @@ sealed record TenantDbConnectionSettings(
     string SslMode
 );
 
+sealed record DbObjectName(string? SchemaName, string ObjectName);
+
+sealed record TenantViewColumn(
+    string ColumnName,
+    string DataType,
+    int Ordinal
+);
+
 sealed record TenantDbHealthResponse(
     string Status,
     string Provider,
@@ -7061,6 +7648,10 @@ sealed record SaveAdminRelationRequest(
     string RelationName,
     Guid SourceViewId,
     Guid TargetViewId,
+    string? SourceRegionType = "view",
+    Guid? SourceRelationId = null,
+    string? TargetRegionType = "view",
+    Guid? TargetRelationId = null,
     string? JoinType = "INNER JOIN",
     string? DescriptionTr = null,
     bool IsActive = true,
@@ -7087,6 +7678,12 @@ sealed record AdminRelationResponse(
     string SourceViewName,
     Guid TargetViewId,
     string TargetViewName,
+    string SourceRegionType,
+    Guid? SourceRelationId,
+    string SourceRegionName,
+    string TargetRegionType,
+    Guid? TargetRelationId,
+    string TargetRegionName,
     string JoinType,
     string DescriptionTr,
     bool IsActive,
@@ -7100,6 +7697,12 @@ sealed record AdminRelationResponseBuilder(
     string SourceViewName,
     Guid TargetViewId,
     string TargetViewName,
+    string SourceRegionType,
+    Guid? SourceRelationId,
+    string SourceRegionName,
+    string TargetRegionType,
+    Guid? TargetRelationId,
+    string TargetRegionName,
     string JoinType,
     string DescriptionTr,
     bool IsActive
@@ -7114,6 +7717,12 @@ sealed record AdminRelationResponseBuilder(
         SourceViewName,
         TargetViewId,
         TargetViewName,
+        SourceRegionType,
+        SourceRelationId,
+        SourceRegionName,
+        TargetRegionType,
+        TargetRelationId,
+        TargetRegionName,
         JoinType,
         DescriptionTr,
         IsActive,
